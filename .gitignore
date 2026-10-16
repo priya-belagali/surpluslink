@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# App data and secrets - never commit these
+data/
+.env
+
+# IDE
+.idea/
+*.iml
+.DS_Store

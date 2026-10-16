@@ -1,0 +1,9 @@
+streamlit>=1.37
+sqlalchemy>=2.0
+pandas>=2.0
+python-dotenv>=1.0
+apscheduler>=3.10
+tzdata>=2024.1
+pytest>=8.0
+# Optional: only needed if you enable real SMS/WhatsApp alerts
+# twilio>=9.0
