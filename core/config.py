@@ -20,6 +20,10 @@ OFFER_TIMEOUT_MIN = int(os.getenv("OFFER_TIMEOUT_MIN", "15"))
 MAX_MATCH_RADIUS_KM = float(os.getenv("MAX_MATCH_RADIUS_KM", "30"))
 VOLUNTEER_RADIUS_KM = 25.0
 
+# DEMO_MODE=true lets every verified NGO see and claim every open listing right away
+# (skips the priority-offer wait). Handy for testing; leave off for the real escalation flow.
+DEMO_MODE = os.getenv("DEMO_MODE", "false").strip().lower() in ("1", "true", "yes")
+
 # Food must be picked up at least this long before it stops being safe
 PICKUP_BUFFER_MIN = 30
 MIN_PICKUP_WINDOW_MIN = 15

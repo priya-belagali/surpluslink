@@ -77,7 +77,7 @@ def claim_listing(session, listing_id: int, ngo: User) -> tuple[bool, str]:
     has_offer = session.scalar(
         select(Offer.id).where(Offer.listing_id == listing_id, Offer.ngo_id == ngo.id, Offer.status == "pending")
     )
-    if not (has_offer or listing.visible_to_all):
+    if not (has_offer or listing.visible_to_all or config.DEMO_MODE):
         return False, "This listing is currently offered to another NGO."
 
     n = now()

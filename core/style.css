@@ -1,0 +1,88 @@
+@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&display=swap');
+
+:root {
+  --font: "Public Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ink: #14323A;
+  --muted: #5B6F73;
+  --line: #D8E0E0;
+  --surface: #FFFFFF;
+  --brand: #17565E;
+  --brand-soft: #E3F0EF;
+  --ok: #1E7A4F;
+  --warn: #B7791F;
+  --bad: #B42318;
+}
+
+/* Typography */
+.stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea,
+.stApp button, .stApp h1, .stApp h2, .stApp h3, .stApp h4 { font-family: var(--font); }
+.stApp [data-testid="stHeading"] h2 { font-size: 1.4rem; font-weight: 650; letter-spacing: -0.01em; }
+.stApp [data-testid="stHeading"] h3 { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.005em; }
+
+/* Layout */
+.stApp [data-testid="stMainBlockContainer"] { max-width: 1120px; margin: 0 auto; padding-top: 2.25rem; }
+.stApp [data-testid="stSidebar"] { border-right: 1px solid var(--line); }
+
+/* Hide Streamlit chrome */
+#MainMenu, footer, [data-testid="stAppDeployButton"], [data-testid="stDecoration"] { display: none !important; }
+
+/* Page header */
+.stApp .ph { margin: 0 0 1.5rem; }
+.stApp .ph h1 { font-size: 1.85rem; font-weight: 700; letter-spacing: -0.015em; line-height: 1.2; margin: 0; padding: 0; }
+.stApp .ph p { color: var(--muted); margin: 0.35rem 0 0; max-width: 62ch; }
+
+/* Welcome page */
+.stApp .hero-name { font-weight: 700; color: var(--brand); letter-spacing: 0.01em; margin-bottom: 2.25rem; }
+.stApp .hero h1 { font-size: 2.6rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; margin: 0 0 1rem; padding: 0; max-width: 16ch; }
+.stApp .hero-sub { font-size: 1.1rem; color: var(--muted); max-width: 46ch; margin: 0; }
+.stApp .steps { list-style: none; counter-reset: step; padding: 0; margin: 2rem 0 0; max-width: 52ch; }
+.stApp .steps li { counter-increment: step; display: grid; grid-template-columns: 1.75rem 1fr; gap: 0.5rem; padding: 0.85rem 0; border-top: 1px solid var(--line); margin: 0; }
+.stApp .steps li::before { content: counter(step); font-weight: 700; color: var(--brand); }
+.stApp .hero-note { margin: 1.25rem 0 0; color: var(--muted); font-size: 0.95rem; }
+.stApp .hero-note b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+/* Listing card (the time rail is the one signature element) */
+.stApp .lcard-top { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+.stApp .lcard-title { display: flex; align-items: center; font-size: 1.05rem; font-weight: 600; }
+.stApp .lcard-side { display: flex; align-items: center; gap: 0.75rem; white-space: nowrap; }
+.stApp .lcard-qty { color: var(--muted); }
+.stApp .lcard-qty b { color: var(--ink); font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+.stApp .lmeta { display: flex; flex-wrap: wrap; gap: 0.2rem 1.25rem; color: var(--muted); font-size: 0.9rem; margin: 0.3rem 0 0.85rem; }
+.stApp .rail { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.stApp .rail > div { height: 100%; border-radius: 3px; background: var(--brand); }
+.stApp .rail-warn > div { background: var(--warn); }
+.stApp .rail-bad > div { background: var(--bad); }
+.stApp .rail-text { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.85rem; color: var(--muted); margin-top: 0.4rem; font-variant-numeric: tabular-nums; }
+.stApp .collect { font-size: 0.88rem; font-weight: 600; margin-top: 0.35rem; }
+
+/* Veg / non-veg marks follow the Indian food-labelling convention */
+.stApp .vm { display: inline-block; position: relative; width: 14px; height: 14px; border: 2px solid currentColor; border-radius: 2px; box-sizing: border-box; margin-right: 0.6rem; flex: none; }
+.stApp .vm::after { content: ""; position: absolute; inset: 2px; border-radius: 50%; background: currentColor; }
+.stApp .vm-veg { color: var(--ok); }
+.stApp .vm-nonveg { color: #9A3412; }
+
+/* Status badges */
+.stApp .badge { display: inline-block; padding: 0.1rem 0.6rem; border-radius: 999px; border: 1px solid; font-size: 0.78rem; font-weight: 600; }
+.stApp .badge-open { color: var(--brand); background: var(--brand-soft); border-color: #BFDCD9; }
+.stApp .badge-claimed { color: #8A5A12; background: #FBF0DC; border-color: #EFD9AE; }
+.stApp .badge-transit { color: #2F4E86; background: #E8EEF9; border-color: #C9D6EF; }
+.stApp .badge-done { color: #17603D; background: #E3F3EA; border-color: #BFE2CF; }
+.stApp .badge-muted { color: var(--muted); background: #EEF2F2; border-color: var(--line); }
+
+/* Sidebar account block */
+.stApp .acct { padding: 0.25rem 0 0.85rem; margin-bottom: 0.75rem; border-bottom: 1px solid var(--line); }
+.stApp .acct-name { font-weight: 650; }
+.stApp .acct-role { color: var(--muted); font-size: 0.88rem; margin-bottom: 0.45rem; }
+
+/* Components */
+.stApp [data-testid="stMetric"] { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px; }
+.stApp [data-testid="stMetricValue"] { font-weight: 700; font-variant-numeric: tabular-nums; }
+.stApp [data-testid="stForm"] { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 1.25rem; }
+.stApp button[data-baseweb="tab"] { font-weight: 600; }
+.stApp button[data-testid^="stBaseButton"] { border-radius: 8px; font-weight: 600; }
+
+@media (max-width: 760px) {
+  .stApp .hero h1 { font-size: 1.9rem; }
+  .stApp .ph h1 { font-size: 1.55rem; }
+  .stApp .lcard-top { flex-direction: column; gap: 0.25rem; }
+}

@@ -2,15 +2,9 @@
 
 Hotels, caterers and canteens post surplus food; verified NGOs claim it; volunteers transport it.
 
-**Features:**
-- **Modern UI & Design System**: Responsive cards, real-time status pills (Veg/Non-veg/Urgency), glassmorphism metric cards, and 1-click demo role switching.
-- **Role-Based Workspaces**: Tailored dashboards for Donors (hotels/caterers), Verified NGOs, Volunteer Drivers, and Platform Admins.
-- **Smart Dispatch & 15-Minute Escalation**: Geospatial matching offering food to the closest verified NGO with matched meal capacity.
-- **Food Safety Intelligence**: Real-time safe-until countdowns and FSSAI-aligned thermal window tracking.
-- **Visual Order Lifecycle Stepper**: 4-stage tracking (`Listed ➔ Claimed ➔ In Transit ➔ Delivered`) with interactive Google Maps navigation links.
-- **One-Tap Quick Repost & Meal Templates**: Rapid dish presets for hotel banquets and cafeterias.
-- **Impact Intelligence & AI Forecast**: Ecological savings (CO₂e abated, car km and tree-days offsets), Altair 30-day velocity charts, champion leaderboards, and weekday surplus projections.
-- **Admin Verification Desk & Operations**: NGO accreditation dossiers, live user directory, recent listings monitor, and instant engine housekeeping.
+**Features:** role-based accounts · NGO verification by admin · food-safety "safe until" countdowns ·
+smart matching with 15-minute escalation · one-tap repeat donation · in-app (and optional
+SMS/WhatsApp) notifications · impact reports · simple next-day surplus forecast.
 
 ## Quick start
 
@@ -25,22 +19,20 @@ python worker.py              # optional 2nd terminal: escalation while nobody i
 pytest                        # run the tests
 ```
 
+Set `DEMO_MODE=true` in `.env` while testing so every NGO sees every open listing immediately.
+
 Demo logins (after seeding): `donor1@demo.com`, `ngo1@demo.com`, `vol1@demo.com`, plus the admin from `.env`
-(default `admin@example.com` / `admin123`). Alternatively, click any role under **"⚡ Quick Demo Access"** on the home page or sidebar!
+(default `admin@example.com` / `admin123`, change it).
 
 ## Layout
 
 ```
-.streamlit/config.toml   Custom theme configuration (emerald brand palette)
-Home.py                  Hero banner, 1-click demo login, role action hubs, live feed
-pages/
-  1_Post_Food.py         One-tap re-post, meal templates, interactive safety calculator
-  2_Find_Food.py         Geospatial map, diet & urgency filters, priority offers & open board
-  3_My_Activity.py       Visual lifecycle stepper, contact dossiers, maps routing, CSR CSV export
-  4_Impact.py            Environmental offsets (CO2/trees/cars), Altair velocity chart, AI forecast
-  5_Admin.py             NGO accreditation desk, user directory, manual engine tick
-core/                    db models · auth · matching · listings · safety · impact · forecast · notify · ui
-worker.py                background escalation/expiry (optional)
+Home.py                  entry point: setup, then a role-based navigation menu
+views/                   welcome, overview, post_food, find_food, activity, impact, admin
+core/                    db models, auth, matching, listings, safety, impact, forecast, notify, ui
+core/style.css           the visual theme (colours, type, cards); edit this to restyle the app
+.streamlit/config.toml   base theme and toolbar settings
+worker.py                background escalation and expiry (optional)
 seed_demo.py             demo data
 tests/                   pytest suite
 ```

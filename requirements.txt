@@ -1,4 +1,4 @@
-streamlit>=1.37
+streamlit>=1.46
 sqlalchemy>=2.0
 pandas>=2.0
 python-dotenv>=1.0
