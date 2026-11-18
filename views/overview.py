@@ -1,34 +1,63 @@
-"""Role-specific overview: the numbers that matter and the next step."""
+"""Role-specific overview: the numbers that matter, and for donors the live journey of each listing."""
+from datetime import timedelta
+
 import streamlit as st
 from sqlalchemy import func, select
 
-from core import config, impact, ui
+from core import config, forecast, impact, matching, ui
 from core.db import Listing, Offer, User, now, session_scope
 from core.geo import haversine_km
+from core.listings import timeline
 
 user = ui.current_user()
-ui.page_header("Overview", f"Signed in as {user.display_name}.")
+ui.page_header("Overview", f"{user.display_name}, {ui.ROLE_LABEL[user.role].lower()}")
 ui.verification_notice(user)
 
 ACTIVE = ["open", "claimed", "picked_up"]
 
 
+@st.fragment(run_every=5)
+def live_listings() -> None:
+    """Refreshes every 5 seconds and moves the cascade along, so offers can be watched passing from NGO to NGO."""
+    ui.run_tick()
+    at = now()
+    with session_scope() as s:
+        active = s.scalars(select(Listing).where(Listing.donor_id == user.id, Listing.status.in_(ACTIVE))
+                           .order_by(Listing.id.desc())).all()
+        blocks = [(l, timeline(s, l), matching.pending_offer(s, l.id) if l.status == "open" else None) for l in active]
+    if not blocks:
+        st.info("You have no active listings.")
+    for l, events, pending in blocks:
+        with st.container(border=True):
+            st.markdown(ui.listing_html(l, show_status=True, show_donor=False, at=at), unsafe_allow_html=True)
+            st.markdown(ui.timeline_html(events, pending, at), unsafe_allow_html=True)
+
+
 def donor_view(s):
     stats = impact.stats(s, user.id)
-    active = s.scalars(select(Listing).where(Listing.donor_id == user.id, Listing.status.in_(ACTIVE))
-                       .order_by(Listing.id.desc())).all()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Meals delivered", stats["meals"])
-    c2.metric("Active listings", len(active))
-    c3.metric("Waiting for an NGO", sum(l.status == "open" for l in active))
-    st.subheader("Active listings")
-    if not active:
-        st.info("You have no active listings. Post surplus food and nearby NGOs are notified straight away.")
-    for l in active:
-        with st.container(border=True):
-            st.markdown(ui.listing_html(l, badge_html=ui.status_badge(l.status), show_donor=False),
-                        unsafe_allow_html=True)
+    active = s.scalars(select(Listing).where(Listing.donor_id == user.id, Listing.status.in_(ACTIVE))).all()
+    ui.figures([("Meals delivered", stats["meals"]), ("Active listings", len(active)),
+                ("Waiting for an NGO", sum(l.status == "open" for l in active))])
+    st.subheader("Listings in progress")
+    live_listings()
     st.page_link("views/post_food.py", label="Post surplus food")
+
+    st.subheader("Tomorrow")
+    tomorrow = (now() + timedelta(days=1)).date()
+    f = forecast.donor_forecast_detail(s, user.id, tomorrow)
+    if f["expected"] is None:
+        st.caption("There is not enough history for a forecast yet.")
+        return
+    expected = round(f["expected"])
+    st.markdown(f"Expected surplus on {tomorrow:%A}: about **{expected} meals**. Past range {round(f['low'])} to "
+                f"{round(f['high'])}, from {f['days']} past days ({f['basis']}).")
+    if st.button("Alert the nearest NGOs in advance"):
+        with session_scope() as s2:
+            names = matching.heads_up(s2, user, expected, f"on {tomorrow:%A}")
+        if names:
+            st.success("Heads-up sent to " + ", ".join(names) + ".")
+        else:
+            st.warning("No approved NGO with a saved location is in range.")
 
 
 def ngo_view(s):
@@ -39,12 +68,9 @@ def ngo_view(s):
     others = [l for l in open_ if (l.visible_to_all or config.DEMO_MODE) and l.id not in offered]
     active = s.scalar(select(func.count(Listing.id)).where(Listing.ngo_id == user.id,
                                                            Listing.status.in_(["claimed", "picked_up"])))
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Priority offers for you", len(priority))
-    c2.metric("Open to all NGOs", len(others))
-    c3.metric("Pickups in progress", active)
-    st.page_link("views/find_food.py", label="See available food")
-    st.page_link("views/activity.py", label="Manage my pickups")
+    ui.figures([("Offers waiting for you", len(priority)), ("Open to all NGOs", len(others)), ("Pickups in progress", active)])
+    st.page_link("views/find_food.py", label="Available food")
+    st.page_link("views/activity.py", label="My pickups")
 
 
 def volunteer_view(s):
@@ -53,21 +79,18 @@ def volunteer_view(s):
               haversine_km(user.lat, user.lon, j.lat, j.lon) <= config.VOLUNTEER_RADIUS_KM]
     mine = s.scalar(select(func.count(Listing.id)).where(Listing.volunteer_id == user.id,
                                                          Listing.status.in_(["claimed", "picked_up"])))
-    c1, c2 = st.columns(2)
-    c1.metric("Jobs near you", len(nearby))
-    c2.metric("Your jobs in progress", mine)
-    st.page_link("views/find_food.py", label="See transport jobs")
-    st.page_link("views/activity.py", label="Manage my jobs")
+    ui.figures([("Jobs near you", len(nearby)), ("Your jobs in progress", mine)])
+    st.page_link("views/find_food.py", label="Transport jobs")
+    st.page_link("views/activity.py", label="My jobs")
 
 
 def admin_view(s):
     pending = s.scalar(select(func.count(User.id)).where(User.role == "ngo", User.verified.is_(False)))
     open_now = s.scalar(select(func.count(Listing.id)).where(Listing.status == "open"))
-    c1, c2, c3 = st.columns(3)
-    c1.metric("NGOs awaiting approval", pending)
-    c2.metric("Open listings", open_now)
-    c3.metric("Meals delivered", impact.stats(s)["meals"])
-    st.page_link("views/admin.py", label="Open administration")
+    stats = impact.stats(s)
+    ui.figures([("NGOs awaiting approval", pending), ("Open listings", open_now),
+                ("Meals delivered", stats["meals"]), ("Records available", stats["deliveries"])])
+    st.page_link("views/admin.py", label="Administration")
 
 
 with session_scope() as s:

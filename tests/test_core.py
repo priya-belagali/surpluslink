@@ -10,7 +10,7 @@ os.environ["OFFER_TIMEOUT_MIN"] = "15"
 
 import pytest  # noqa: E402
 
-from core import forecast, impact, listings, matching, safety  # noqa: E402
+from core import forecast, geocode, impact, listings, matching, notify, places, records, safety  # noqa: E402
 from core.auth import authenticate, register_user  # noqa: E402
 from core.db import Base, Listing, Offer, engine, init_db, now, session_scope  # noqa: E402
 from core.geo import haversine_km  # noqa: E402
@@ -128,3 +128,101 @@ def test_forecast_and_safety_and_geo():
     assert forecast.forecast_meals([], today.date()) == (None, 0)
     assert safety.format_minutes(75) == "1h 15m left" and safety.format_minutes(0) == "expired"
     assert 110 < haversine_km(0, 0, 1, 0) < 112
+
+
+# ---------------- cascade, record, alerts, parsing ----------------
+
+def test_cascade_is_visible_in_the_timeline():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        near_id = near.id
+        lid = post(s, donor).id
+        s.query(Offer).update({Offer.expires_at: now() - timedelta(seconds=1)})
+    with session_scope() as s:
+        matching.tick(s)
+        texts = [txt for _, txt in listings.timeline(s, s.get(Listing, lid))]
+        assert any("Offered to Near NGO" in x for x in texts)
+        assert any("Near NGO did not respond" in x for x in texts)
+        assert any("Offered to Far NGO" in x for x in texts)
+        first = s.query(Offer).filter_by(ngo_id=near_id).one()
+        assert first.status == "expired" and first.resolved_at is not None
+        assert matching.pending_offer(s, lid).ngo.display_name == "Far NGO"
+
+
+def test_delivery_completes_the_schedule_2_record():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        donor.fssai_number, near.darpan_id = "DONOR-LIC-1", "DARPAN-1"
+        lid = post(s, donor, quantity_meals=40, temperature_c=68.0).id
+        assert listings.claim_listing(s, lid, near)[0]
+        assert listings.mark_picked_up(s, lid, near)[0]
+        ok, _ = listings.mark_delivered(s, lid, near, quantity_distributed=35, area="Ward 5")
+        assert ok
+        listing = s.get(Listing, lid)
+        rows = dict(records.schedule2_rows(listing))
+        assert len(rows) == 12
+        assert rows["Temperature of food"] == "68.0 degrees C"
+        assert rows["Quantity distributed by surplus food distribution organisation"] == "35 meals"
+        assert rows["Area where food is distributed"] == "Ward 5"
+        assert rows["Batch number of food product (item)"].startswith("SL-")
+        assert "DONOR-LIC-1" in rows["Name and address of the food donor organisation"]
+        assert "DARPAN-1" in rows["Name and address of the surplus food distribution organisation"]
+        assert records.schedule2_pdf(listing).startswith(b"%PDF")
+
+
+def test_cannot_distribute_more_than_was_donated():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        lid = post(s, donor, quantity_meals=10).id
+        listings.claim_listing(s, lid, near)
+        listings.mark_picked_up(s, lid, near)
+        ok, msg = listings.mark_delivered(s, lid, near, quantity_distributed=999)
+        assert ok is False and "between 0 and 10" in msg
+
+
+def test_heads_up_goes_to_the_nearest_ngos_first():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        names = matching.heads_up(s, donor, 60, "tomorrow")
+        assert names[0] == "Near NGO" and "Far NGO" in names
+
+
+def test_repeat_donation_availability_follows_the_food_type(monkeypatch):
+    monkeypatch.setitem(safety.SAFE_HOURS, "Dairy-based dishes", 2)  # pretend this type keeps for only 2 hours
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        post(s, donor, category="Dairy-based dishes")
+        again = listings.repost_last(s, donor)
+        assert (again.pickup_by - now()).total_seconds() <= 1 * 3600 + 5  # not the fixed 2 hours any more
+
+
+def test_timeout_can_be_set_in_seconds():
+    from core import config
+    assert config.OFFER_TIMEOUT_SEC == 15 * 60  # default comes from OFFER_TIMEOUT_MIN
+    assert safety.format_duration(90) == "90 seconds" and safety.format_duration(900) == "15 minutes"
+
+
+def test_geocode_parser_and_phone_format():
+    assert geocode.parse_result([{"lat": "12.30", "lon": "76.64", "display_name": "Mysuru"}]) == \
+        {"lat": 12.3, "lon": 76.64, "name": "Mysuru"}
+    assert geocode.parse_result([]) is None and geocode.parse_result([{"lat": "x"}]) is None
+    assert notify.normalize_phone("98450 12345") == "+919845012345"
+    assert notify.normalize_phone("+1 (415) 555-0100") == "+14155550100"
+
+
+def test_places_parser_classifies_and_uses_centres():
+    data = {"elements": [
+        {"type": "node", "lat": 12.30, "lon": 76.64, "tags": {"amenity": "restaurant", "name": "A"}},
+        {"type": "way", "center": {"lat": 12.31, "lon": 76.65}, "tags": {"tourism": "hotel", "name": "B"}},
+        {"type": "node", "tags": {"amenity": "canteen"}},  # no coordinates: skipped
+    ]}
+    out = places.parse_elements(data)
+    assert [p["kind"] for p in out] == ["Restaurant or cafe", "Hotel or lodging"]
+    assert "around:8000,12.2958,76.6394" in places.build_query(12.2958, 76.6394, 8)
+
+
+def test_forecast_gives_a_range():
+    today = now()
+    rows = [(today - timedelta(days=7 * k), 100 + 20 * k) for k in range(1, 4)]
+    d = forecast.forecast_detail(rows, today.date())
+    assert d["expected"] == 140 and d["low"] == 120 and d["high"] == 160 and d["basis"] == "same weekday"

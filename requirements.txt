@@ -3,7 +3,10 @@ sqlalchemy>=2.0
 pandas>=2.0
 python-dotenv>=1.0
 apscheduler>=3.10
+reportlab>=4.0
 tzdata>=2024.1
 pytest>=8.0
-# Optional: only needed if you enable real SMS/WhatsApp alerts
+# Needed only when DATABASE_URL points at PostgreSQL (for example Neon or Supabase)
+psycopg2-binary>=2.9
+# Needed only for real SMS or WhatsApp alerts
 # twilio>=9.0

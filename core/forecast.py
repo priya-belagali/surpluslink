@@ -11,19 +11,39 @@ from sqlalchemy import select
 from core.db import Listing
 
 
-def forecast_meals(rows: list[tuple], target: date) -> tuple[float | None, int]:
-    """rows = [(created_at, quantity_meals)]. Returns (expected_meals or None, days_of_history_used)."""
+def forecast_detail(rows: list[tuple], target: date) -> dict:
+    """Expected meals for `target` with a low-to-high range.
+
+    Uses the same weekday in past weeks when there are at least two such days, otherwise the
+    overall daily average. Returns expected=None when there is too little history.
+    """
+    empty = {"expected": None, "low": None, "high": None, "days": 0, "basis": None}
     if not rows:
-        return None, 0
+        return empty
     df = pd.DataFrame(rows, columns=["created_at", "meals"])
     df["date"] = pd.to_datetime(df["created_at"]).dt.normalize()
     daily = df.groupby("date")["meals"].sum()
     same_weekday = daily[daily.index.dayofweek == target.weekday()]
     if len(same_weekday) >= 2:
-        return float(same_weekday.mean()), len(same_weekday)
-    if len(daily) >= 3:
-        return float(daily.mean()), len(daily)
-    return None, len(daily)
+        sample, basis = same_weekday, "same weekday"
+    elif len(daily) >= 3:
+        sample, basis = daily, "all days"
+    else:
+        return {**empty, "days": len(daily)}
+    return {"expected": float(sample.mean()), "low": float(sample.min()), "high": float(sample.max()),
+            "days": len(sample), "basis": basis}
+
+
+def forecast_meals(rows: list[tuple], target: date) -> tuple[float | None, int]:
+    """rows = [(created_at, quantity_meals)]. Returns (expected_meals or None, days_of_history_used)."""
+    d = forecast_detail(rows, target)
+    return d["expected"], d["days"]
+
+
+def donor_forecast_detail(session, donor_id: int, target: date) -> dict:
+    rows = session.execute(
+        select(Listing.created_at, Listing.quantity_meals).where(Listing.donor_id == donor_id)).all()
+    return forecast_detail([tuple(r) for r in rows], target)
 
 
 def donor_forecast(session, donor_id: int, target: date) -> tuple[float | None, int]:

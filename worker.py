@@ -5,7 +5,7 @@ The Streamlit app already runs the same housekeeping while someone has it open. 
 """
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-from core import matching
+from core import config, matching
 from core.db import init_db, session_scope
 
 
@@ -19,7 +19,7 @@ def run_tick() -> None:
 if __name__ == "__main__":
     init_db()
     scheduler = BlockingScheduler()
-    scheduler.add_job(run_tick, "interval", seconds=60, max_instances=1)
+    scheduler.add_job(run_tick, "interval", seconds=config.TICK_SECONDS, max_instances=1)
     print("Worker running. Ctrl+C to stop.")
     try:
         scheduler.start()

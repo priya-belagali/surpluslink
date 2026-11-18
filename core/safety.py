@@ -28,3 +28,13 @@ def format_minutes(minutes: int) -> str:
         return "expired"
     h, m = divmod(minutes, 60)
     return f"{h}h {m:02d}m left" if h else f"{m}m left"
+
+
+def format_duration(seconds: int) -> str:
+    """90 -> '90 seconds', 900 -> '15 minutes', 3600 -> '1 hour'."""
+    if seconds < 120:
+        return f"{seconds} seconds"
+    minutes = round(seconds / 60)
+    if minutes < 120:
+        return f"{minutes} minutes"
+    return f"{round(minutes / 60)} hours"

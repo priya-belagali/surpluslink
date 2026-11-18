@@ -25,6 +25,7 @@ def create_listing(
     description: str | None = None,
     event_type: str | None = None,
     photo_path: str | None = None,
+    temperature_c: float | None = None,
 ) -> Listing:
     n = now()
     if not title.strip():
@@ -33,6 +34,8 @@ def create_listing(
         raise ValueError("Quantity must be at least 1 meal.")
     if cooked_at > n:
         raise ValueError("Cooked time cannot be in the future.")
+    if temperature_c is not None and not (-30 <= temperature_c <= 120):
+        raise ValueError("Please check the temperature: it should be between -30 and 120 degrees C.")
 
     safe_until = safety.compute_safe_until(category, cooked_at)
     latest_pickup = safe_until - timedelta(minutes=config.PICKUP_BUFFER_MIN)
@@ -47,9 +50,11 @@ def create_listing(
         donor_id=donor.id, title=title.strip(), category=category, veg=veg,
         quantity_meals=quantity_meals, description=description, event_type=event_type,
         address=address, lat=lat, lon=lon, cooked_at=cooked_at, safe_until=safe_until,
-        pickup_by=pickup_by, photo_path=photo_path,
+        pickup_by=pickup_by, photo_path=photo_path, temperature_c=temperature_c,
     )
     session.add(listing)
+    session.flush()
+    listing.batch_ref = f"SL-{n:%y%m%d}-{listing.id}"
     session.flush()
     session.refresh(listing)
     matching.start_matching(session, listing)
@@ -64,7 +69,8 @@ def repost_last(session, donor: User) -> Listing:
     return create_listing(
         session, donor, title=last.title, category=last.category, veg=last.veg,
         quantity_meals=last.quantity_meals, address=last.address, lat=last.lat, lon=last.lon,
-        cooked_at=now(), available_hours=2, description=last.description, event_type=last.event_type,
+        cooked_at=now(), available_hours=min(2.0, max(0.5, safety.SAFE_HOURS.get(last.category, 3) - 1.0)),
+        description=last.description, event_type=last.event_type,
     )
 
 
@@ -92,10 +98,11 @@ def claim_listing(session, listing_id: int, ngo: User) -> tuple[bool, str]:
 
     session.execute(
         update(Offer).where(Offer.listing_id == listing_id, Offer.status == "pending", Offer.ngo_id == ngo.id)
-        .values(status="accepted")
+        .values(status="accepted", resolved_at=n)
     )
     session.execute(
-        update(Offer).where(Offer.listing_id == listing_id, Offer.status == "pending").values(status="cancelled")
+        update(Offer).where(Offer.listing_id == listing_id, Offer.status == "pending")
+        .values(status="cancelled", resolved_at=n)
     )
     session.refresh(listing)
 
@@ -114,6 +121,7 @@ def decline_offer(session, listing_id: int, ngo: User) -> None:
     if offer is None:
         return
     offer.status = "declined"
+    offer.resolved_at = now()
     listing = session.get(Listing, listing_id)
     if listing and listing.status == "open":
         matching.offer_next(session, listing)
@@ -158,9 +166,46 @@ def mark_picked_up(session, listing_id: int, user: User) -> tuple[bool, str]:
     return ok, msg
 
 
-def mark_delivered(session, listing_id: int, user: User) -> tuple[bool, str]:
+def mark_delivered(session, listing_id: int, user: User, quantity_distributed: int | None = None,
+                   area: str | None = None) -> tuple[bool, str]:
+    """Confirm delivery. The quantity and area go into the surplus-food record."""
+    listing = session.get(Listing, listing_id)
+    if listing is None:
+        return False, "Listing not found."
+    if quantity_distributed is not None and not (0 <= quantity_distributed <= listing.quantity_meals):
+        return False, f"Quantity distributed must be between 0 and {listing.quantity_meals}."
     ok, msg = _advance(session, listing_id, user, "picked_up", "delivered", "delivered_at")
     if ok:
         listing = session.get(Listing, listing_id)
-        notify(session, listing.donor_id, f"'{listing.title}' reached people in need ({listing.quantity_meals} meals).")
+        listing.qty_distributed = listing.quantity_meals if quantity_distributed is None else quantity_distributed
+        listing.area_distributed = (area or "").strip() or None
+        notify(session, listing.donor_id,
+               f"'{listing.title}' was distributed: {listing.qty_distributed} meals. The record is ready to download.")
     return ok, msg
+
+
+def timeline(session, listing: Listing) -> list[tuple[datetime, str]]:
+    """Every step of a listing's journey in time order, including each offer in the cascade."""
+    events = [(listing.created_at, f"Posted by {listing.donor.display_name}")]
+    offers = session.scalars(select(Offer).where(Offer.listing_id == listing.id).order_by(Offer.offered_at, Offer.id)).all()
+    for o in offers:
+        name = o.ngo.display_name
+        events.append((o.offered_at, f"Offered to {name}"))
+        if o.status == "expired":
+            events.append((o.expires_at, f"{name} did not respond; the offer moved on"))
+        elif o.status == "declined":
+            events.append((o.resolved_at or o.expires_at, f"{name} declined"))
+    if listing.opened_to_all_at:
+        events.append((listing.opened_to_all_at, "Every NGO in range has been asked; now open to all"))
+    if listing.claimed_at and listing.ngo is not None:
+        events.append((listing.claimed_at, f"Claimed by {listing.ngo.display_name}"))
+    if listing.picked_up_at:
+        who = f" by {listing.volunteer.name}" if listing.volunteer is not None else ""
+        events.append((listing.picked_up_at, f"Collected{who}"))
+    if listing.delivered_at:
+        n = listing.qty_distributed if listing.qty_distributed is not None else listing.quantity_meals
+        events.append((listing.delivered_at, f"Delivered: {n} meals distributed"))
+    if listing.expired_at:
+        events.append((listing.expired_at, "Expired without being claimed"))
+    events.sort(key=lambda e: e[0])
+    return events

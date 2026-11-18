@@ -16,21 +16,21 @@ is_vol = user.role == "volunteer"
 
 ui.page_header(
     "Transport jobs" if is_vol else "Available food",
-    "Food that an NGO has claimed and that still needs a driver." if is_vol else
-    "The best-matched NGO is asked first. Claim before the offer expires, or it moves to the next NGO.",
+    "Food an NGO has claimed that still needs a driver." if is_vol else
+    "The best-matched NGO is asked first. Respond before the offer runs out, or it moves to the next NGO.",
 )
 ui.verification_notice(user)
 if user.role == "ngo" and not user.verified:
     st.stop()
 
 
-def card(l: Listing, *, priority: bool) -> None:
+def card(l: Listing, *, priority: bool, offer_expires=None) -> None:
     dist = haversine_km(user.lat, user.lon, l.lat, l.lon) if user.lat is not None else None
     has_photo = bool(l.photo_path and os.path.exists(l.photo_path))
     with st.container(border=True):
         left, right = st.columns([4, 1]) if has_photo else (st.container(), None)
         with left:
-            st.markdown(ui.listing_html(l, distance_km=dist), unsafe_allow_html=True)
+            st.markdown(ui.listing_html(l, distance_km=dist, offer_expires=offer_expires), unsafe_allow_html=True)
             if l.description:
                 st.caption(l.description)
             if is_vol:
@@ -56,14 +56,16 @@ def card(l: Listing, *, priority: bool) -> None:
             right.image(l.photo_path)
 
 
-@st.fragment(run_every=30)
+@st.fragment(run_every=5)
 def board() -> None:
-    """Refreshes every 30 seconds so new offers appear without reloading."""
+    """Refreshes every 5 seconds so offers and their countdowns stay current."""
+    ui.run_tick()
     flash = st.session_state.pop("flash", None)
     if flash:
         (st.success if flash[0] else st.error)(flash[1])
 
     n = now()
+    offers: dict[int, object] = {}
     with session_scope() as s:
         if is_vol:
             jobs = s.scalars(select(Listing).where(Listing.status == "claimed", Listing.volunteer_id.is_(None))).all()
@@ -71,29 +73,31 @@ def board() -> None:
                         haversine_km(user.lat, user.lon, j.lat, j.lon) <= config.VOLUNTEER_RADIUS_KM]
             others: list[Listing] = []
         else:
-            offered = set(s.scalars(select(Offer.listing_id).where(Offer.ngo_id == user.id, Offer.status == "pending")))
+            offers = {o.listing_id: o.expires_at for o in
+                      s.scalars(select(Offer).where(Offer.ngo_id == user.id, Offer.status == "pending"))}
             open_ = s.scalars(select(Listing).where(Listing.status == "open", Listing.pickup_by > n)
                               .order_by(Listing.safe_until)).all()
-            priority = [l for l in open_ if l.id in offered]
-            others = [l for l in open_ if (l.visible_to_all or config.DEMO_MODE) and l.id not in offered]
+            priority = [l for l in open_ if l.id in offers]
+            others = [l for l in open_ if (l.visible_to_all or config.DEMO_MODE) and l.id not in offers]
 
     shown = priority + others
     if shown:
-        with st.expander("Map", expanded=True):
+        with st.expander("Map", expanded=False):
             st.map(pd.DataFrame({"lat": [l.lat for l in shown], "lon": [l.lon for l in shown]}),
-                   latitude="lat", longitude="lon", color="#17565E", size=150)
+                   latitude="lat", longitude="lon", color="#23405F", size=120)
 
-    st.subheader(f"Jobs near you ({len(priority)})" if is_vol else f"Priority offers ({len(priority)})")
+    st.subheader(f"Jobs near you ({len(priority)})" if is_vol else f"Offered to you ({len(priority)})")
     if not priority:
-        st.info("Nothing waiting for you right now. This page refreshes on its own.")
+        st.info("Nothing is waiting for you right now. This page updates on its own.")
     for l in priority:
-        card(l, priority=True)
+        card(l, priority=True, offer_expires=offers.get(l.id))
 
     if not is_vol:
         st.subheader(f"Open to all NGOs ({len(others)})")
         if not others:
-            st.info("When the first NGO does not respond in time, a listing moves to the next one and finally to everyone."
-                    + (" Demo mode is on, so every open listing shows here immediately." if config.DEMO_MODE else ""))
+            st.info("When the NGO asked first does not respond in time, a listing moves to the next one, "
+                    "and finally to every NGO in range." +
+                    (" Demo mode is on, so every open listing is shown here immediately." if config.DEMO_MODE else ""))
         for l in others:
             card(l, priority=False)
 
