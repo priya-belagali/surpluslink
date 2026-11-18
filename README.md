@@ -82,3 +82,5 @@ tests/                   pytest suite
 - Login is demo-grade: no email verification, password reset or attempt limits.
 - The forecast is a same-weekday average. It needs real history to mean anything.
 - The coverage counts come from OpenStreetMap, which is volunteer-edited and incomplete.
+
+
