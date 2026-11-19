@@ -1,0 +1,3321 @@
+﻿=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\.streamlit\config.toml ===
+[theme]
+base = "light"
+primaryColor = "#23405F"
+backgroundColor = "#F5F6F4"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1B2630"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\assistant.py ===
+"""Optional language-model assistant: turn a sentence into a pre-filled donation form.
+
+Off unless ANTHROPIC_API_KEY is set. The text typed is sent to the Anthropic API, so do not type anything private.
+The model only suggests values. Every suggestion is validated here, and the donor reviews the form before posting.
+"""
+import json
+import os
+import re
+import urllib.request
+from datetime import time
+
+from core import config, safety
+
+API_URL = "https://api.anthropic.com/v1/messages"
+CATEGORIES = list(safety.SAFE_HOURS)
+
+
+class AssistantError(Exception):
+    """Anything that stops the assistant from returning usable values. The message is safe to show."""
+
+
+def available() -> bool:
+    return bool(os.getenv("ANTHROPIC_API_KEY"))
+
+
+def system_prompt() -> str:
+    cats = "; ".join(f'"{c}"' for c in CATEGORIES)
+    return (
+        "You turn a short description of leftover food into fields for a donation form. "
+        "Reply with ONE JSON object and nothing else, using exactly these keys: "
+        '"title" (short text), "category" (one of: ' + cats + '), "veg" (true or false), '
+        '"quantity_meals" (whole number), "cooked_time" (24-hour "HH:MM"), "temperature_c" (number), "notes" (text). '
+        "Use null for anything the description does not say. Never guess a number. "
+        "If the description says plates, portions or servings, treat each as one meal."
+    )
+
+
+def validate(raw: dict) -> dict:
+    """Keep only values of the right type and range. Anything else is dropped (the form keeps its default)."""
+    out: dict = {}
+    title = raw.get("title")
+    if isinstance(title, str) and title.strip():
+        out["title"] = title.strip()[:160]
+    if raw.get("category") in CATEGORIES:
+        out["category"] = raw["category"]
+    if isinstance(raw.get("veg"), bool):
+        out["veg"] = raw["veg"]
+    q = raw.get("quantity_meals")
+    if isinstance(q, (int, float)) and not isinstance(q, bool) and 1 <= q <= 100000:
+        out["quantity_meals"] = int(q)
+    ct = raw.get("cooked_time")
+    if isinstance(ct, str):
+        m = re.fullmatch(r"\s*([01]?\d|2[0-3]):([0-5]\d)\s*", ct)
+        if m:
+            out["cooked_time"] = time(int(m.group(1)), int(m.group(2)))
+    t = raw.get("temperature_c")
+    if isinstance(t, (int, float)) and not isinstance(t, bool) and -30 <= t <= 120:
+        out["temperature_c"] = float(t)
+    notes = raw.get("notes")
+    if isinstance(notes, str) and notes.strip():
+        out["notes"] = notes.strip()[:500]
+    return out
+
+
+def parse_response(text: str) -> dict:
+    """Pull the JSON object out of the model's reply (it may wrap it in a code fence) and validate it."""
+    match = re.search(r"\{.*\}", text or "", re.S)
+    if not match:
+        raise AssistantError("The assistant did not return usable values. Please fill the form by hand.")
+    try:
+        raw = json.loads(match.group(0))
+    except ValueError:
+        raise AssistantError("The assistant's reply could not be read. Please fill the form by hand.") from None
+    if not isinstance(raw, dict):
+        raise AssistantError("The assistant's reply was not in the expected form.")
+    values = validate(raw)
+    if not values:
+        raise AssistantError("Nothing in that description could be turned into form fields.")
+    return values
+
+
+def parse_listing_text(description: str) -> dict:
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        raise AssistantError("The assistant is not switched on. Set ANTHROPIC_API_KEY to enable it.")
+    body = {"model": config.LLM_MODEL, "max_tokens": 400, "system": system_prompt(),
+            "messages": [{"role": "user", "content": (description or "")[:1000]}]}
+    req = urllib.request.Request(
+        API_URL, data=json.dumps(body).encode(),
+        headers={"content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.load(resp)
+    except Exception as exc:
+        print(f"[assistant] request failed: {exc}")
+        raise AssistantError("The assistant could not be reached. Please fill the form by hand.") from None
+    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    return parse_response(text)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\auth.py ===
+"""Registration and login. Passwords are salted PBKDF2 hashes (never stored in plain text)."""
+import hashlib
+import hmac
+import os
+
+from sqlalchemy import select
+
+from core import config
+from core.db import User
+
+_ITERATIONS = 200_000
+
+
+def hash_password(password: str) -> str:
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _ITERATIONS)
+    return f"{salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt_hex, hash_hex = stored.split("$")
+        salt = bytes.fromhex(salt_hex)
+    except ValueError:
+        return False
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, _ITERATIONS)
+    return hmac.compare_digest(digest.hex(), hash_hex)
+
+
+def register_user(session, *, email: str, password: str, name: str, role: str, **extra) -> User:
+    email = email.strip().lower()
+    if role not in ("donor", "ngo", "volunteer"):
+        raise ValueError("Invalid role.")
+    if "@" not in email or "." not in email:
+        raise ValueError("Please enter a valid email address.")
+    if len(password) < 6:
+        raise ValueError("Password must be at least 6 characters.")
+    if not name.strip():
+        raise ValueError("Please enter your name.")
+    if session.scalar(select(User).where(User.email == email)):
+        raise ValueError("An account with this email already exists.")
+
+    user = User(
+        email=email,
+        password_hash=hash_password(password),
+        name=name.strip(),
+        role=role,
+        verified=(role != "ngo"),  # NGOs must be approved by an admin before claiming food
+        **extra,
+    )
+    session.add(user)
+    session.flush()
+    return user
+
+
+def authenticate(session, email: str, password: str) -> User | None:
+    user = session.scalar(select(User).where(User.email == email.strip().lower()))
+    if user and verify_password(password, user.password_hash):
+        return user
+    return None
+
+
+def ensure_admin(session) -> None:
+    email = config.ADMIN_EMAIL.lower()
+    if session.scalar(select(User).where(User.email == email)):
+        return
+    session.add(
+        User(
+            email=email,
+            password_hash=hash_password(config.ADMIN_PASSWORD),
+            name="Administrator",
+            role="admin",
+            verified=True,
+        )
+    )
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\config.py ===
+"""Central configuration. Override anything with environment variables or a .env file."""
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
+
+
+def _flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
+
+
+DATA_DIR = BASE_DIR / "data"
+PHOTO_DIR = DATA_DIR / "photos"
+DATA_DIR.mkdir(exist_ok=True)
+PHOTO_DIR.mkdir(exist_ok=True)
+PLACES_FILE = DATA_DIR / "places.json"
+GEOCODE_CACHE = DATA_DIR / "geocode_cache.json"
+
+DB_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'app.db'}")
+TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Kolkata")
+
+# Matching and escalation. OFFER_TIMEOUT_SEC wins if set; use 90 for a quick on-stage demo.
+OFFER_TIMEOUT_MIN = int(os.getenv("OFFER_TIMEOUT_MIN", "15"))
+OFFER_TIMEOUT_SEC = int(os.getenv("OFFER_TIMEOUT_SEC", str(OFFER_TIMEOUT_MIN * 60)))
+TICK_SECONDS = int(os.getenv("TICK_SECONDS", "10"))
+MAX_MATCH_RADIUS_KM = float(os.getenv("MAX_MATCH_RADIUS_KM", "30"))
+VOLUNTEER_RADIUS_KM = 25.0
+
+# Adaptive matching adds a penalty for NGOs that often waste time (silent or declining), learned from
+# offer history. With no history every NGO gets the same penalty, so the order is just the distance rule.
+ADAPTIVE_MATCHING = _flag("ADAPTIVE_MATCHING", "true")
+
+# Optional language-model assistant that pre-fills the donation form from a sentence.
+# It is off unless ANTHROPIC_API_KEY is set. The text typed is sent to the Anthropic API.
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-5-5")
+
+# DEMO_MODE=true lets every verified NGO see and claim every open listing right away,
+# which switches the priority-offer cascade off. Leave it off when you want to show the cascade.
+DEMO_MODE = _flag("DEMO_MODE")
+# SEED_DEMO_ON_EMPTY=true fills an empty database with clearly labelled demo accounts and history.
+SEED_DEMO_ON_EMPTY = _flag("SEED_DEMO_ON_EMPTY")
+
+# Food must be picked up at least this long before the planning limit for its type
+PICKUP_BUFFER_MIN = 30
+MIN_PICKUP_WINDOW_MIN = 15
+
+# Default admin account (created on first run). CHANGE THE PASSWORD via .env.
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@example.com")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
+
+# Rough impact estimates: editable assumptions, not measurements
+KG_PER_MEAL = 0.4
+CO2E_KG_PER_KG_FOOD = 2.5
+
+# Address search (OpenStreetMap Nominatim asks for an identifying contact in the User-Agent)
+GEOCODE_CONTACT = os.getenv("GEOCODE_CONTACT", "")
+
+# Coverage map
+COVERAGE_CITY = os.getenv("COVERAGE_CITY", "Mysuru")
+COVERAGE_RADIUS_KM = float(os.getenv("COVERAGE_RADIUS_KM", "8"))
+
+CITY_PRESETS = {
+    "Bengaluru": (12.9716, 77.5946),
+    "Mysuru": (12.2958, 76.6394),
+    "Chennai": (13.0827, 80.2707),
+    "Hyderabad": (17.3850, 78.4867),
+    "Mumbai": (19.0760, 72.8777),
+    "Pune": (18.5204, 73.8567),
+    "Delhi": (28.6139, 77.2090),
+    "Kolkata": (22.5726, 88.3639),
+}
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\db.py ===
+"""Database models and session helpers (SQLAlchemy 2.x, SQLite by default)."""
+from contextlib import contextmanager
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text, create_engine, inspect, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+
+from core import config
+
+
+def now() -> datetime:
+    """Current local time as a naive datetime (the app assumes a single region)."""
+    return datetime.now(ZoneInfo(config.TIMEZONE)).replace(tzinfo=None)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    name: Mapped[str] = mapped_column(String(120))
+    org_name: Mapped[str | None] = mapped_column(String(160), default=None)
+    role: Mapped[str] = mapped_column(String(20))  # donor | ngo | volunteer | admin
+    phone: Mapped[str | None] = mapped_column(String(32), default=None)
+    address: Mapped[str | None] = mapped_column(String(300), default=None)
+    lat: Mapped[float | None] = mapped_column(Float, default=None)
+    lon: Mapped[float | None] = mapped_column(Float, default=None)
+    capacity_meals: Mapped[int] = mapped_column(default=0)  # NGOs: meals they can handle at once
+    has_vehicle: Mapped[bool] = mapped_column(Boolean, default=False)
+    verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    fssai_number: Mapped[str | None] = mapped_column(String(40), default=None)  # donor licence or NGO registration
+    darpan_id: Mapped[str | None] = mapped_column(String(40), default=None)  # NGOs: NGO Darpan unique ID
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+    @property
+    def display_name(self) -> str:
+        return self.org_name or self.name
+
+
+class Listing(Base):
+    __tablename__ = "listings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    donor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    category: Mapped[str] = mapped_column(String(80))
+    veg: Mapped[bool] = mapped_column(Boolean, default=True)
+    quantity_meals: Mapped[int] = mapped_column(default=1)
+    description: Mapped[str | None] = mapped_column(Text, default=None)
+    event_type: Mapped[str | None] = mapped_column(String(60), default=None)
+    address: Mapped[str] = mapped_column(String(300))
+    lat: Mapped[float] = mapped_column(Float)
+    lon: Mapped[float] = mapped_column(Float)
+    cooked_at: Mapped[datetime] = mapped_column(DateTime)
+    safe_until: Mapped[datetime] = mapped_column(DateTime)
+    pickup_by: Mapped[datetime] = mapped_column(DateTime)
+    photo_path: Mapped[str | None] = mapped_column(String(300), default=None)
+    temperature_c: Mapped[float | None] = mapped_column(Float, default=None)  # food temperature when packed
+    batch_ref: Mapped[str | None] = mapped_column(String(40), default=None)
+    qty_distributed: Mapped[int | None] = mapped_column(default=None)
+    area_distributed: Mapped[str | None] = mapped_column(String(160), default=None)
+
+    # open -> claimed -> picked_up -> delivered   (or open -> expired)
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    ngo_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), default=None)
+    volunteer_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), default=None)
+    visible_to_all: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    picked_up_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    opened_to_all_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+
+    donor: Mapped[User] = relationship(foreign_keys=[donor_id], lazy="joined")
+    ngo: Mapped[User | None] = relationship(foreign_keys=[ngo_id], lazy="joined")
+    volunteer: Mapped[User | None] = relationship(foreign_keys=[volunteer_id], lazy="joined")
+
+
+class Offer(Base):
+    """A priority offer of one listing to one NGO. Used for the escalation chain."""
+
+    __tablename__ = "offers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    listing_id: Mapped[int] = mapped_column(ForeignKey("listings.id"), index=True)
+    ngo_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    # pending | accepted | declined | expired | cancelled
+    offered_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
+
+    ngo: Mapped[User] = relationship(foreign_keys=[ngo_id], lazy="joined")
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    message: Mapped[str] = mapped_column(String(500))
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+engine = create_engine(
+    config.DB_URL,
+    connect_args={"check_same_thread": False} if config.DB_URL.startswith("sqlite") else {},
+)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+@contextmanager
+def session_scope():
+    """Commit on success, roll back on error, always close."""
+    session = SessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+# Columns added after the first release. create_all() only builds missing tables, so an existing
+# database gets these added in place the next time the app starts.
+_NEW_COLUMNS = {
+    "users": [("fssai_number", "VARCHAR(40)"), ("darpan_id", "VARCHAR(40)")],
+    "listings": [("temperature_c", "FLOAT"), ("batch_ref", "VARCHAR(40)"), ("qty_distributed", "INTEGER"),
+                 ("area_distributed", "VARCHAR(160)"), ("opened_to_all_at", "TIMESTAMP"), ("expired_at", "TIMESTAMP")],
+    "offers": [("resolved_at", "TIMESTAMP")],
+}
+
+
+def _ensure_columns() -> None:
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table, columns in _NEW_COLUMNS.items():
+            if not insp.has_table(table):
+                continue
+            have = {c["name"] for c in insp.get_columns(table)}
+            for name, sql_type in columns:
+                if name not in have:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"))
+
+
+def init_db() -> None:
+    from core.auth import ensure_admin
+
+    Base.metadata.create_all(engine)
+    _ensure_columns()
+    with session_scope() as session:
+        ensure_admin(session)
+    if config.SEED_DEMO_ON_EMPTY:
+        from core.demo import seed_if_empty
+
+        with session_scope() as session:
+            seed_if_empty(session)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\demo.py ===
+"""Demo data: clearly labelled sample accounts and eight weeks of history.
+
+Used by seed_demo.py, and by the app itself when SEED_DEMO_ON_EMPTY=true so a freshly deployed
+site is not empty. Every demo account uses the password demo123 and has "(demo)" in its name.
+"""
+import random
+from datetime import timedelta
+
+from sqlalchemy import func, select
+
+from core import config
+from core.auth import register_user
+from core.db import Listing, Offer, User, now
+
+DEMO_PASSWORD = "demo123"
+
+
+def _near(rng, base, km=6.0):
+    d = km / 111  # one degree of latitude is about 111 km
+    return base[0] + rng.uniform(-d, d), base[1] + rng.uniform(-d, d)
+
+
+def seed_if_empty(session) -> bool:
+    if session.scalar(select(func.count(User.id)).where(User.role == "donor")):
+        return False
+    seed(session)
+    return True
+
+
+def seed(session) -> None:
+    rng = random.Random(7)
+    base = config.CITY_PRESETS[config.COVERAGE_CITY]
+    city = config.COVERAGE_CITY
+
+    donors = []
+    for i, name in enumerate(["Cauvery Banquets (demo)", "Lakeview Caterers (demo)", "Technopark Canteen (demo)"], 1):
+        lat, lon = _near(rng, base)
+        donors.append(register_user(
+            session, email=f"donor{i}@demo.com", password=DEMO_PASSWORD, name=name, role="donor", org_name=name,
+            address=f"{name}, {city}", lat=lat, lon=lon, fssai_number=f"DEMO-FSSAI-00{i}"))
+
+    ngos = []
+    specs = [("Annapurna Food Bank (demo)", 200, True), ("Hope Kitchen Trust (demo)", 80, False),
+             ("Seva Meals Society (demo)", 150, True)]
+    for i, (name, capacity, vehicle) in enumerate(specs, 1):
+        lat, lon = _near(rng, base)
+        u = register_user(session, email=f"ngo{i}@demo.com", password=DEMO_PASSWORD, name=name, role="ngo",
+                          org_name=name, address=f"{name}, {city}", lat=lat, lon=lon, capacity_meals=capacity,
+                          has_vehicle=vehicle, fssai_number=f"DEMO-FSSAI-10{i}", darpan_id=f"DEMO-DARPAN-0{i}")
+        u.verified = True
+        ngos.append(u)
+
+    lat, lon = _near(rng, base)
+    register_user(session, email="vol1@demo.com", password=DEMO_PASSWORD, name="Ravi (volunteer, demo)",
+                  role="volunteer", address=city, lat=lat, lon=lon)
+
+    # Eight weeks of delivered history. Weekends are busier (events and weddings). Each listing also gets the offers
+    # that led to its claim, from NGOs with different habits: the second one often does not answer, so the learned
+    # ranking has something real to learn from. Habits: (chance of silence, chance of accepting if it answers, minutes).
+    habits = [(0.10, 0.85, 3.0), (0.55, 0.70, 8.0), (0.25, 0.80, 5.0)]
+    timeout = 15.0
+    n = now()
+    serial = 0
+    for day in range(56, 0, -1):
+        when = (n - timedelta(days=day)).replace(hour=21, minute=0, second=0, microsecond=0)
+        for donor in donors:
+            if rng.random() < 0.7:
+                serial += 1
+                meals = rng.randint(30, 80) + (40 if when.weekday() >= 5 else 0)
+                listing = Listing(
+                    donor_id=donor.id, title="Dinner surplus", category="Cooked meal (rice, curry, etc.)",
+                    veg=True, quantity_meals=meals, address=donor.address, lat=donor.lat, lon=donor.lon,
+                    cooked_at=when - timedelta(hours=1), safe_until=when + timedelta(hours=3),
+                    pickup_by=when + timedelta(hours=2), status="delivered", created_at=when,
+                    temperature_c=float(rng.randint(62, 75)), batch_ref=f"SL-{when:%y%m%d}-D{serial}",
+                    qty_distributed=meals, area_distributed=f"Community kitchen, {city}")
+                session.add(listing)
+                session.flush()
+
+                clock, claimed_by = when, None
+                order = list(range(len(ngos)))
+                rng.shuffle(order)
+                for idx in order:
+                    silent, accept, mean = habits[idx]
+                    if rng.random() < silent:
+                        status, took = "expired", timeout
+                    else:
+                        took = min(timeout, rng.expovariate(1 / mean))
+                        status = "accepted" if rng.random() < accept else "declined"
+                    session.add(Offer(listing_id=listing.id, ngo_id=ngos[idx].id, status=status, offered_at=clock,
+                                      expires_at=clock + timedelta(minutes=timeout),
+                                      resolved_at=clock + timedelta(minutes=took)))
+                    clock += timedelta(minutes=took)
+                    if status == "accepted":
+                        claimed_by = ngos[idx]
+                        break
+                if claimed_by is None:  # nobody took it from the offers: it was opened to all and one NGO claimed it
+                    claimed_by = rng.choice(ngos)
+                    listing.opened_to_all_at = clock
+                listing.ngo_id = claimed_by.id
+                listing.claimed_at = clock
+                listing.picked_up_at = clock + timedelta(minutes=30)
+                listing.delivered_at = clock + timedelta(minutes=65)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\forecast.py ===
+"""Surplus forecasting.
+
+With two weeks or more of history: the average of the same weekday in earlier weeks, counting days with no
+donation as zero, with a range from how much those days varied. With less history: a rougher average of the
+days that had donations. A back-test (see learning.backtest) checks it against simply assuming the overall
+average. Candidate models with more parameters (a regression on weekday and trend) were tried on demo-like
+data and did not beat this, so they are not used.
+"""
+from datetime import date
+
+import pandas as pd
+from sqlalchemy import select
+
+from core import learning
+from core.db import Listing
+
+
+def forecast_detail(rows: list[tuple], target: date) -> dict:
+    """Expected meals for `target` with a low-to-high range.
+
+    Uses the same weekday in past weeks when there are at least two such days, otherwise the
+    overall daily average. Returns expected=None when there is too little history.
+    """
+    empty = {"expected": None, "low": None, "high": None, "days": 0, "basis": None}
+    if not rows:
+        return empty
+    better = learning.weekday_forecast(rows, target)
+    if better is not None:
+        return better
+    df = pd.DataFrame(rows, columns=["created_at", "meals"])
+    df["date"] = pd.to_datetime(df["created_at"]).dt.normalize()
+    daily = df.groupby("date")["meals"].sum()
+    same_weekday = daily[daily.index.dayofweek == target.weekday()]
+    if len(same_weekday) >= 2:
+        sample, basis = same_weekday, "same weekday"
+    elif len(daily) >= 3:
+        sample, basis = daily, "all days"
+    else:
+        return {**empty, "days": len(daily)}
+    return {"expected": float(sample.mean()), "low": float(sample.min()), "high": float(sample.max()),
+            "days": len(sample), "basis": basis}
+
+
+def forecast_meals(rows: list[tuple], target: date) -> tuple[float | None, int]:
+    """rows = [(created_at, quantity_meals)]. Returns (expected_meals or None, days_of_history_used)."""
+    d = forecast_detail(rows, target)
+    return d["expected"], d["days"]
+
+
+def donor_forecast_detail(session, donor_id: int, target: date) -> dict:
+    rows = session.execute(
+        select(Listing.created_at, Listing.quantity_meals).where(Listing.donor_id == donor_id)).all()
+    return forecast_detail([tuple(r) for r in rows], target)
+
+
+def donor_forecast(session, donor_id: int, target: date) -> tuple[float | None, int]:
+    rows = session.execute(
+        select(Listing.created_at, Listing.quantity_meals).where(Listing.donor_id == donor_id)).all()
+    return forecast_meals([tuple(r) for r in rows], target)
+
+
+def platform_forecast(session, target: date) -> tuple[float, int]:
+    """Total expected meals tomorrow across donors with enough history, and how many donors counted."""
+    donor_ids = session.scalars(select(Listing.donor_id).distinct()).all()
+    total, counted = 0.0, 0
+    for donor_id in donor_ids:
+        expected, _ = donor_forecast(session, donor_id, target)
+        if expected is not None:
+            total += expected
+            counted += 1
+    return round(total), counted
+
+
+def platform_backtest(session, as_of: date) -> dict | None:
+    """How well the weekday forecast would have done over the last two weeks, against the naive average."""
+    rows = [tuple(r) for r in session.execute(select(Listing.created_at, Listing.quantity_meals)).all()]
+    return learning.backtest(rows, as_of)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\geo.py ===
+from math import asin, cos, radians, sin, sqrt
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in kilometres."""
+    lat1, lon1, lat2, lon2 = map(radians, (lat1, lon1, lat2, lon2))
+    a = sin((lat2 - lat1) / 2) ** 2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
+    return 2 * 6371.0088 * asin(sqrt(a))
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\geocode.py ===
+"""Address search using the public OpenStreetMap Nominatim service.
+
+Its usage policy asks for: at most one request per second, an identifying User-Agent, cached
+results, and visible attribution. No bulk lookups and no search-as-you-type.
+"""
+import json
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+from core import config
+
+ATTRIBUTION = "Address search by OpenStreetMap Nominatim. Map data from OpenStreetMap contributors."
+_lock = threading.Lock()
+_last_call = [0.0]
+
+
+def _user_agent() -> str:
+    return f"SurplusLink/1.0 ({config.GEOCODE_CONTACT or 'student project'})"
+
+
+def parse_result(data) -> dict | None:
+    """Turn a Nominatim /search response into {lat, lon, name}, or None."""
+    if not data:
+        return None
+    first = data[0]
+    try:
+        return {"lat": float(first["lat"]), "lon": float(first["lon"]), "name": str(first.get("display_name", ""))}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _load_cache() -> dict:
+    try:
+        return json.loads(config.GEOCODE_CACHE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        config.GEOCODE_CACHE.write_text(json.dumps(cache), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def geocode(query: str) -> dict | None:
+    q = " ".join((query or "").split())
+    if len(q) < 4:
+        return None
+    key = q.lower()
+    cache = _load_cache()
+    if key in cache:
+        return cache[key]
+
+    with _lock:  # keep to one request per second across all visitors
+        wait = 1.1 - (time.time() - _last_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_call[0] = time.time()
+        params = urllib.parse.urlencode({"q": q, "format": "jsonv2", "limit": 1, "countrycodes": "in"})
+        req = urllib.request.Request(f"https://nominatim.openstreetmap.org/search?{params}",
+                                     headers={"User-Agent": _user_agent(), "Accept-Language": "en"})
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.load(resp)
+        except Exception as exc:
+            print(f"[geocode] lookup failed: {exc}")
+            return None
+
+    result = parse_result(data)
+    if result:
+        cache[key] = result
+        _save_cache(cache)
+    return result
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\impact.py ===
+"""Impact reporting based on delivered listings. Constants in config are rough estimates."""
+from datetime import timedelta
+
+import pandas as pd
+from sqlalchemy import func, select
+
+from core import config
+from core.db import Listing, User, now
+
+
+def stats(session, donor_id: int | None = None) -> dict:
+    q = select(func.coalesce(func.sum(Listing.quantity_meals), 0), func.count(Listing.id),
+               func.count(func.distinct(Listing.donor_id))).where(Listing.status == "delivered")
+    if donor_id:
+        q = q.where(Listing.donor_id == donor_id)
+    meals, deliveries, donors = session.execute(q).one()
+    kg = meals * config.KG_PER_MEAL
+    return {"meals": int(meals), "deliveries": deliveries, "donors": donors,
+            "kg_food": round(kg, 1), "co2e_kg": round(kg * config.CO2E_KG_PER_KG_FOOD, 1)}
+
+
+def daily_series(session, days: int = 30, donor_id: int | None = None) -> pd.DataFrame:
+    since = now() - timedelta(days=days)
+    q = select(Listing.delivered_at, Listing.quantity_meals).where(
+        Listing.status == "delivered", Listing.delivered_at >= since)
+    if donor_id:
+        q = q.where(Listing.donor_id == donor_id)
+    rows = session.execute(q).all()
+    if not rows:
+        return pd.DataFrame({"meals": []})
+    df = pd.DataFrame(rows, columns=["when", "meals"])
+    df["date"] = pd.to_datetime(df["when"]).dt.date
+    return df.groupby("date")[["meals"]].sum()
+
+
+def leaderboard(session, limit: int = 10) -> list[tuple[str, int]]:
+    q = (select(User.org_name, User.name, func.sum(Listing.quantity_meals).label("m"))
+         .join(Listing, Listing.donor_id == User.id)
+         .where(Listing.status == "delivered")
+         .group_by(User.id).order_by(func.sum(Listing.quantity_meals).desc()).limit(limit))
+    return [(org or name, int(m)) for org, name, m in session.execute(q).all()]
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\intelligence.py ===
+"""Bridge between the database and the learning routines."""
+from sqlalchemy import select
+
+from core.db import Offer
+from core.learning import NgoHistory
+
+
+def ngo_history(session) -> dict[int, NgoHistory]:
+    """What each NGO has done with past offers: accepted, declined, or never responded, and how long it took."""
+    rows = session.execute(
+        select(Offer.ngo_id, Offer.status, Offer.offered_at, Offer.resolved_at)
+        .where(Offer.status.in_(["accepted", "declined", "expired"]))
+    ).all()
+    out: dict[int, NgoHistory] = {}
+    for ngo_id, status, offered_at, resolved_at in rows:
+        if resolved_at is None:
+            continue
+        minutes = max((resolved_at - offered_at).total_seconds() / 60, 0.0)
+        h = out.setdefault(ngo_id, NgoHistory())
+        if status == "accepted":
+            h.accepted += 1
+            h.accept_minutes += minutes
+        elif status == "declined":
+            h.declined += 1
+            h.fail_minutes += minutes
+        else:
+            h.expired += 1
+            h.fail_minutes += minutes
+    return out
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\learning.py ===
+"""Small, explainable learning routines.
+
+Nothing here touches the database or Streamlit, so each routine can be tested and simulated on its own.
+
+1. Offer outcomes -> how likely each NGO is to accept, and how long it typically takes (Bayesian smoothing).
+2. Daily surplus -> a ridge regression on weekday and trend, with a walk-forward back-test.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, timedelta
+
+import numpy as np
+
+# ---------------------------------------------------------------- NGO behaviour
+
+PRIOR_ACCEPT = (2.0, 2.0)  # Beta(2, 2): with no history we assume about 50 percent, and move slowly
+MINUTES_PER_KM = 2.0       # rough urban travel speed (30 km/h), to put waiting time and distance on one scale
+
+
+@dataclass
+class NgoHistory:
+    accepted: int = 0
+    declined: int = 0
+    expired: int = 0           # the NGO never responded before the offer ran out
+    accept_minutes: float = 0.0  # total time taken by offers that were accepted
+    fail_minutes: float = 0.0    # total time consumed by offers that were declined or expired
+
+    @property
+    def total(self) -> int:
+        return self.accepted + self.declined + self.expired
+
+    @property
+    def failed(self) -> int:
+        return self.declined + self.expired
+
+
+def acceptance_probability(accepted: int, total: int, prior: tuple[float, float] = PRIOR_ACCEPT) -> float:
+    """Share of offers accepted, pulled towards 50 percent when there is little evidence."""
+    a, b = prior
+    return (accepted + a) / (total + a + b)
+
+
+def smoothed_mean(total_minutes: float, count: int, prior_mean: float, prior_weight: float = 2.0) -> float:
+    """Average that starts at prior_mean and moves towards the data as observations arrive."""
+    return (total_minutes + prior_mean * prior_weight) / (count + prior_weight)
+
+
+def expected_wait_minutes(h: NgoHistory, timeout_min: float) -> float:
+    """Expected minutes before this NGO resolves an offer (accepts it, or fails and we must move on)."""
+    p = acceptance_probability(h.accepted, h.total)
+    accept_mean = smoothed_mean(h.accept_minutes, h.accepted, prior_mean=timeout_min / 3)
+    fail_mean = smoothed_mean(h.fail_minutes, h.failed, prior_mean=timeout_min)
+    return p * accept_mean + (1 - p) * fail_mean
+
+
+def wait_penalty_km(wait_minutes: float) -> float:
+    """Waiting time expressed as extra kilometres, so it can be added to the distance score."""
+    return wait_minutes / MINUTES_PER_KM
+
+
+# ---------------------------------------------------------------- surplus forecast
+
+def daily_totals(rows: list[tuple], as_of: date) -> tuple[list[date], np.ndarray]:
+    """Meals per calendar day up to as_of. Days with no donation count as zero, which matters:
+    leaving them out makes a donor who gives only now and then look like a steady one."""
+    totals: dict[date, float] = {}
+    for when, meals in rows:
+        d = when.date() if hasattr(when, "date") else when
+        if d <= as_of:
+            totals[d] = totals.get(d, 0.0) + float(meals)
+    if not totals:
+        return [], np.array([])
+    start = min(totals)
+    days = [start + timedelta(days=i) for i in range((as_of - start).days + 1)]
+    return days, np.array([totals.get(d, 0.0) for d in days])
+
+
+def weekday_forecast(rows: list[tuple], target: date, as_of: date | None = None, min_days: int = 14) -> dict | None:
+    """Expected meals on `target` from the same weekday in earlier weeks, zero days included.
+
+    The range is the mean plus or minus 1.28 standard deviations of those same-weekday totals (about 80
+    percent of days if they are roughly bell-shaped). None when there is less than `min_days` of history.
+    """
+    as_of = as_of or (target - timedelta(days=1))
+    days, y = daily_totals(rows, as_of)
+    if len(days) < min_days:
+        return None
+    same = np.array([v for d, v in zip(days, y) if d.weekday() == target.weekday()])
+    sample = same if len(same) >= 2 else y
+    mean = float(sample.mean())
+    sd = float(sample.std(ddof=1)) if len(sample) > 1 else 0.0
+    return {"expected": mean, "low": max(mean - 1.28 * sd, 0.0), "high": mean + 1.28 * sd,
+            "days": len(sample), "basis": "same weekday, zero days included" if len(same) >= 2 else "all days", "sigma": sd}
+
+
+def naive_forecast(rows: list[tuple], as_of: date) -> float | None:
+    """The comparison point: tomorrow will look like the overall daily average."""
+    days, y = daily_totals(rows, as_of)
+    return float(y.mean()) if len(days) else None
+
+
+def backtest(rows: list[tuple], as_of: date, horizon_days: int = 14, min_train: int = 14) -> dict | None:
+    """Walk forward over the last `horizon_days`, predicting each day from earlier data only.
+
+    Returns the average absolute error, in meals per day, of the weekday forecast and of the naive average.
+    """
+    days, actual = daily_totals(rows, as_of)
+    if len(days) < min_train + 7:
+        return None
+    err_weekday, err_naive = [], []
+    for i in range(len(days) - horizon_days, len(days)):
+        if i < min_train:
+            continue
+        prior_end = days[i] - timedelta(days=1)
+        model = weekday_forecast(rows, days[i], as_of=prior_end, min_days=min_train)
+        naive = naive_forecast(rows, prior_end)
+        if model is None or naive is None:
+            continue
+        err_weekday.append(abs(model["expected"] - actual[i]))
+        err_naive.append(abs(naive - actual[i]))
+    if len(err_weekday) < 5:
+        return None
+    w, n = float(np.mean(err_weekday)), float(np.mean(err_naive))
+    return {"mae_weekday": w, "mae_naive": n, "days_tested": len(err_weekday),
+            "improvement_pct": (1 - w / n) * 100 if n > 0 else 0.0}
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\listings.py ===
+"""Listing lifecycle: create, claim, decline, transport, pick up, deliver."""
+from datetime import datetime, timedelta
+
+from sqlalchemy import select, update
+
+from core import config, matching, safety
+from core.db import Listing, Offer, User, now
+from core.geo import haversine_km
+from core.notify import notify
+
+
+def create_listing(
+    session,
+    donor: User,
+    *,
+    title: str,
+    category: str,
+    veg: bool,
+    quantity_meals: int,
+    address: str,
+    lat: float,
+    lon: float,
+    cooked_at: datetime,
+    available_hours: float,
+    description: str | None = None,
+    event_type: str | None = None,
+    photo_path: str | None = None,
+    temperature_c: float | None = None,
+) -> Listing:
+    n = now()
+    if not title.strip():
+        raise ValueError("Please give the donation a short title.")
+    if quantity_meals < 1:
+        raise ValueError("Quantity must be at least 1 meal.")
+    if cooked_at > n:
+        raise ValueError("Cooked time cannot be in the future.")
+    if temperature_c is not None and not (-30 <= temperature_c <= 120):
+        raise ValueError("Please check the temperature: it should be between -30 and 120 degrees C.")
+
+    safe_until = safety.compute_safe_until(category, cooked_at)
+    latest_pickup = safe_until - timedelta(minutes=config.PICKUP_BUFFER_MIN)
+    pickup_by = min(n + timedelta(hours=available_hours), latest_pickup)
+    if pickup_by < n + timedelta(minutes=config.MIN_PICKUP_WINDOW_MIN):
+        raise ValueError(
+            "This food has too little safe time left to be collected and distributed. "
+            "Please do not donate it."
+        )
+
+    listing = Listing(
+        donor_id=donor.id, title=title.strip(), category=category, veg=veg,
+        quantity_meals=quantity_meals, description=description, event_type=event_type,
+        address=address, lat=lat, lon=lon, cooked_at=cooked_at, safe_until=safe_until,
+        pickup_by=pickup_by, photo_path=photo_path, temperature_c=temperature_c,
+    )
+    session.add(listing)
+    session.flush()
+    listing.batch_ref = f"SL-{n:%y%m%d}-{listing.id}"
+    session.flush()
+    session.refresh(listing)
+    matching.start_matching(session, listing)
+    return listing
+
+
+def repost_last(session, donor: User) -> Listing:
+    """One-tap repeat: same details as the donor's last listing, cooked just now."""
+    last = session.scalar(select(Listing).where(Listing.donor_id == donor.id).order_by(Listing.id.desc()))
+    if last is None:
+        raise ValueError("You have no previous donation to repeat yet.")
+    return create_listing(
+        session, donor, title=last.title, category=last.category, veg=last.veg,
+        quantity_meals=last.quantity_meals, address=last.address, lat=last.lat, lon=last.lon,
+        cooked_at=now(), available_hours=min(2.0, max(0.5, safety.SAFE_HOURS.get(last.category, 3) - 1.0)),
+        description=last.description, event_type=last.event_type,
+    )
+
+
+def claim_listing(session, listing_id: int, ngo: User) -> tuple[bool, str]:
+    if ngo.role != "ngo" or not ngo.verified:
+        return False, "Only verified NGOs can claim food."
+    listing = session.get(Listing, listing_id)
+    if listing is None:
+        return False, "Listing not found."
+    has_offer = session.scalar(
+        select(Offer.id).where(Offer.listing_id == listing_id, Offer.ngo_id == ngo.id, Offer.status == "pending")
+    )
+    if not (has_offer or listing.visible_to_all or config.DEMO_MODE):
+        return False, "This listing is currently offered to another NGO."
+
+    n = now()
+    # Atomic claim: only one NGO can win, even if two click at the same moment.
+    result = session.execute(
+        update(Listing)
+        .where(Listing.id == listing_id, Listing.status == "open", Listing.pickup_by > n)
+        .values(status="claimed", ngo_id=ngo.id, claimed_at=n)
+    )
+    if result.rowcount != 1:
+        return False, "Sorry, this listing was just claimed by someone else or has expired."
+
+    session.execute(
+        update(Offer).where(Offer.listing_id == listing_id, Offer.status == "pending", Offer.ngo_id == ngo.id)
+        .values(status="accepted", resolved_at=n)
+    )
+    session.execute(
+        update(Offer).where(Offer.listing_id == listing_id, Offer.status == "pending")
+        .values(status="cancelled", resolved_at=n)
+    )
+    session.refresh(listing)
+
+    notify(session, listing.donor_id, f"{ngo.display_name} will collect your '{listing.title}'.")
+    if not ngo.has_vehicle:
+        for v in session.scalars(select(User).where(User.role == "volunteer", User.lat.is_not(None))):
+            if haversine_km(listing.lat, listing.lon, v.lat, v.lon) <= config.VOLUNTEER_RADIUS_KM:
+                notify(session, v.id, f"Transport needed: {listing.quantity_meals} meals from {listing.donor.display_name}.")
+    return True, "Claimed! Arrange pickup before the deadline."
+
+
+def decline_offer(session, listing_id: int, ngo: User) -> None:
+    offer = session.scalar(
+        select(Offer).where(Offer.listing_id == listing_id, Offer.ngo_id == ngo.id, Offer.status == "pending")
+    )
+    if offer is None:
+        return
+    offer.status = "declined"
+    offer.resolved_at = now()
+    listing = session.get(Listing, listing_id)
+    if listing and listing.status == "open":
+        matching.offer_next(session, listing)
+
+
+def take_transport(session, listing_id: int, volunteer: User) -> tuple[bool, str]:
+    if volunteer.role != "volunteer":
+        return False, "Only volunteers can take transport jobs."
+    result = session.execute(
+        update(Listing)
+        .where(Listing.id == listing_id, Listing.status == "claimed", Listing.volunteer_id.is_(None))
+        .values(volunteer_id=volunteer.id)
+    )
+    if result.rowcount != 1:
+        return False, "Another volunteer already took this job."
+    listing = session.get(Listing, listing_id)
+    session.refresh(listing)
+    notify(session, listing.ngo_id, f"{volunteer.name} will transport '{listing.title}'.")
+    notify(session, listing.donor_id, f"{volunteer.name} is on the way to collect '{listing.title}'.")
+    return True, "Thank you! The job is yours."
+
+
+def _advance(session, listing_id: int, user: User, from_status: str, to_status: str, stamp: str) -> tuple[bool, str]:
+    listing = session.get(Listing, listing_id)
+    if listing is None or user.id not in (listing.ngo_id, listing.volunteer_id):
+        return False, "You are not assigned to this listing."
+    result = session.execute(
+        update(Listing).where(Listing.id == listing_id, Listing.status == from_status)
+        .values(status=to_status, **{stamp: now()})
+    )
+    if result.rowcount != 1:
+        return False, f"Listing is not in '{from_status}' state."
+    session.refresh(listing)
+    return True, ""
+
+
+def mark_picked_up(session, listing_id: int, user: User) -> tuple[bool, str]:
+    ok, msg = _advance(session, listing_id, user, "claimed", "picked_up", "picked_up_at")
+    if ok:
+        listing = session.get(Listing, listing_id)
+        notify(session, listing.donor_id, f"'{listing.title}' has been picked up. Thank you!")
+    return ok, msg
+
+
+def mark_delivered(session, listing_id: int, user: User, quantity_distributed: int | None = None,
+                   area: str | None = None) -> tuple[bool, str]:
+    """Confirm delivery. The quantity and area go into the surplus-food record."""
+    listing = session.get(Listing, listing_id)
+    if listing is None:
+        return False, "Listing not found."
+    if quantity_distributed is not None and not (0 <= quantity_distributed <= listing.quantity_meals):
+        return False, f"Quantity distributed must be between 0 and {listing.quantity_meals}."
+    ok, msg = _advance(session, listing_id, user, "picked_up", "delivered", "delivered_at")
+    if ok:
+        listing = session.get(Listing, listing_id)
+        listing.qty_distributed = listing.quantity_meals if quantity_distributed is None else quantity_distributed
+        listing.area_distributed = (area or "").strip() or None
+        notify(session, listing.donor_id,
+               f"'{listing.title}' was distributed: {listing.qty_distributed} meals. The record is ready to download.")
+    return ok, msg
+
+
+def timeline(session, listing: Listing) -> list[tuple[datetime, str]]:
+    """Every step of a listing's journey in time order, including each offer in the cascade."""
+    events = [(listing.created_at, f"Posted by {listing.donor.display_name}")]
+    offers = session.scalars(select(Offer).where(Offer.listing_id == listing.id).order_by(Offer.offered_at, Offer.id)).all()
+    for o in offers:
+        name = o.ngo.display_name
+        events.append((o.offered_at, f"Offered to {name}"))
+        if o.status == "expired":
+            events.append((o.expires_at, f"{name} did not respond; the offer moved on"))
+        elif o.status == "declined":
+            events.append((o.resolved_at or o.expires_at, f"{name} declined"))
+    if listing.opened_to_all_at:
+        events.append((listing.opened_to_all_at, "Every NGO in range has been asked; now open to all"))
+    if listing.claimed_at and listing.ngo is not None:
+        events.append((listing.claimed_at, f"Claimed by {listing.ngo.display_name}"))
+    if listing.picked_up_at:
+        who = f" by {listing.volunteer.name}" if listing.volunteer is not None else ""
+        events.append((listing.picked_up_at, f"Collected{who}"))
+    if listing.delivered_at:
+        n = listing.qty_distributed if listing.qty_distributed is not None else listing.quantity_meals
+        events.append((listing.delivered_at, f"Delivered: {n} meals distributed"))
+    if listing.expired_at:
+        events.append((listing.expired_at, "Expired without being claimed"))
+    events.sort(key=lambda e: e[0])
+    return events
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\matching.py ===
+"""Smart matching: rank NGOs, offer to the best one, escalate if nobody answers."""
+from datetime import timedelta
+from types import SimpleNamespace
+
+from sqlalchemy import select, update
+
+from core import config, intelligence, learning
+from core.db import Listing, Offer, User, now
+from core.geo import haversine_km
+from core.notify import notify
+from core.safety import format_duration
+
+
+def rank_details(session, listing) -> list[dict]:
+    """Every NGO in range with the working behind its score, best first. Lower score is better.
+
+    score = distance (km)
+            + 15 if the NGO cannot absorb the whole batch
+            - 4 if it has its own vehicle
+            + waiting penalty learned from how it handled past offers (when ADAPTIVE_MATCHING is on)
+
+    `listing` only needs .lat, .lon and .quantity_meals, so a plain object works for forecasts.
+    """
+    ngos = session.scalars(
+        select(User).where(User.role == "ngo", User.verified.is_(True), User.lat.is_not(None))
+    ).all()
+    history = intelligence.ngo_history(session) if config.ADAPTIVE_MATCHING else {}
+    timeout_min = config.OFFER_TIMEOUT_SEC / 60
+    out = []
+    for ngo in ngos:
+        dist = haversine_km(listing.lat, listing.lon, ngo.lat, ngo.lon)
+        if dist > config.MAX_MATCH_RADIUS_KM:
+            continue
+        capacity_ok = ngo.capacity_meals >= listing.quantity_meals
+        score = dist + (0 if capacity_ok else 15) - (4 if ngo.has_vehicle else 0)
+        h = history.get(ngo.id, learning.NgoHistory())
+        wait = learning.expected_wait_minutes(h, timeout_min)
+        penalty = learning.wait_penalty_km(wait) if config.ADAPTIVE_MATCHING else 0.0
+        out.append({
+            "ngo": ngo, "distance": round(dist, 1), "capacity_ok": capacity_ok, "vehicle": ngo.has_vehicle,
+            "history": h, "p_accept": learning.acceptance_probability(h.accepted, h.total),
+            "wait_min": wait, "penalty": round(penalty, 2), "score": round(score + penalty, 2),
+        })
+    out.sort(key=lambda r: r["score"])
+    return out
+
+
+def rank_ngos(session, listing) -> list[tuple[User, float, float]]:
+    """Return [(ngo, score, distance_km)] best first."""
+    return [(r["ngo"], r["score"], r["distance"]) for r in rank_details(session, listing)]
+
+
+def pending_offer(session, listing_id: int) -> Offer | None:
+    return session.scalar(
+        select(Offer).where(Offer.listing_id == listing_id, Offer.status == "pending").order_by(Offer.id.desc())
+    )
+
+
+def offer_next(session, listing: Listing) -> bool:
+    """Offer the listing to the next-best NGO not yet asked. If none remain, open it to everyone."""
+    already = set(session.scalars(select(Offer.ngo_id).where(Offer.listing_id == listing.id)))
+    for ngo, _score, dist in rank_ngos(session, listing):
+        if ngo.id in already:
+            continue
+        expires = now() + timedelta(seconds=config.OFFER_TIMEOUT_SEC)
+        session.add(Offer(listing_id=listing.id, ngo_id=ngo.id, expires_at=expires))
+        notify(
+            session,
+            ngo.id,
+            f"Offer: {listing.quantity_meals} meals ({listing.title}) from {listing.donor.display_name}, "
+            f"{dist} km away. Respond in the app within {format_duration(config.OFFER_TIMEOUT_SEC)}.",
+        )
+        return True
+
+    listing.visible_to_all = True
+    listing.opened_to_all_at = now()
+    for ngo, _s, _d in rank_ngos(session, listing):
+        notify(session, ngo.id, f"Open to all NGOs: {listing.quantity_meals} meals ({listing.title}).")
+    return False
+
+
+def start_matching(session, listing: Listing) -> None:
+    offer_next(session, listing)
+
+
+def heads_up(session, donor: User, expected_meals: int, when_text: str, limit: int = 3) -> list[str]:
+    """Tell the nearest NGOs to expect surplus from this donor. Returns the NGO names alerted."""
+    if donor.lat is None or expected_meals < 1:
+        return []
+    probe = SimpleNamespace(lat=donor.lat, lon=donor.lon, quantity_meals=expected_meals)
+    names = []
+    for ngo, _score, dist in rank_ngos(session, probe)[:limit]:
+        notify(session, ngo.id,
+               f"Heads-up: {donor.display_name} expects about {expected_meals} meals of surplus {when_text}, "
+               f"{dist} km from you. No action is needed yet.")
+        names.append(ngo.display_name)
+    return names
+
+
+def tick(session) -> dict:
+    """Housekeeping: expire stale listings and escalate unanswered offers. Safe to call often."""
+    n = now()
+    expired_listings = escalated = 0
+
+    stale = session.scalars(
+        select(Listing).where(Listing.status == "open", (Listing.pickup_by <= n) | (Listing.safe_until <= n))
+    ).all()
+    for listing in stale:
+        listing.status = "expired"
+        listing.expired_at = n
+        session.execute(
+            update(Offer).where(Offer.listing_id == listing.id, Offer.status == "pending")
+            .values(status="cancelled", resolved_at=n)
+        )
+        notify(session, listing.donor_id, f"Your listing '{listing.title}' expired without being collected.")
+        expired_listings += 1
+
+    timed_out = session.scalars(select(Offer).where(Offer.status == "pending", Offer.expires_at <= n)).all()
+    for offer in timed_out:
+        offer.status = "expired"
+        offer.resolved_at = n
+        listing = session.get(Listing, offer.listing_id)
+        if listing and listing.status == "open":
+            offer_next(session, listing)
+            escalated += 1
+
+    session.flush()
+    return {"expired_listings": expired_listings, "escalated": escalated}
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\notify.py ===
+"""Notifications: always stored in-app; optionally also sent through Twilio (SMS or WhatsApp)."""
+import os
+import re
+
+from core.db import Notification, User
+
+
+def normalize_phone(raw: str, default_country: str = "+91") -> str:
+    """'98450 12345' -> '+919845012345'. Numbers that already start with + are kept."""
+    digits = re.sub(r"[^\d+]", "", raw or "")
+    if digits.startswith("+"):
+        return digits
+    digits = digits.lstrip("0")
+    return default_country + digits if digits else ""
+
+
+def notify(session, user_id: int, message: str) -> None:
+    session.add(Notification(user_id=user_id, message=message[:500]))
+    user = session.get(User, user_id)
+    if user and user.phone:
+        _send_external(user.phone, message)
+
+
+def _send_external(phone: str, message: str) -> tuple[bool, str]:
+    """Returns (sent, detail). Quietly does nothing when Twilio is not configured."""
+    sid, token, sender = (os.getenv(k) for k in ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM"))
+    if not (sid and token and sender):
+        return False, "Twilio is not configured, so only in-app alerts are used."
+    to = normalize_phone(phone)
+    if not to:
+        return False, "No valid phone number."
+    try:
+        from twilio.rest import Client  # lazy import so Twilio stays optional
+
+        target = f"whatsapp:{to}" if sender.startswith("whatsapp:") else to
+        Client(sid, token).messages.create(body=message[:1500], from_=sender, to=target)
+        return True, f"Sent to {to}."
+    except Exception as exc:  # never let a failed alert break the main flow
+        print(f"[notify] external send failed: {exc}")
+        return False, f"Sending failed: {exc}"
+
+
+def send_test(phone: str) -> tuple[bool, str]:
+    return _send_external(phone, "SurplusLink test message. If you can read this, alerts are working.")
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\places.py ===
+"""Coverage data: kitchens and venues from OpenStreetMap, cached to data/places.json.
+
+Fetch once with internet access (`py scripts/fetch_places.py`), then the Coverage page works offline.
+"""
+import json
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+from core import config
+
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+
+
+def build_query(lat: float, lon: float, radius_km: float) -> str:
+    r = int(radius_km * 1000)
+    return (
+        "[out:json][timeout:60];(\n"
+        f'  nwr["amenity"~"^(restaurant|fast_food|canteen|food_court|cafe)$"](around:{r},{lat},{lon});\n'
+        f'  nwr["tourism"~"^(hotel|guest_house|hostel)$"](around:{r},{lat},{lon});\n'
+        f'  nwr["amenity"~"^(events_venue|community_centre|social_centre)$"](around:{r},{lat},{lon});\n'
+        ");\nout center tags;"
+    )
+
+
+def classify(tags: dict) -> str:
+    amenity, tourism = tags.get("amenity", ""), tags.get("tourism", "")
+    if tourism in ("hotel", "guest_house", "hostel"):
+        return "Hotel or lodging"
+    if amenity in ("events_venue", "community_centre", "social_centre"):
+        return "Event hall or venue"
+    if amenity == "canteen":
+        return "Canteen"
+    return "Restaurant or cafe"
+
+
+def parse_elements(data: dict) -> list[dict]:
+    places = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        lat = el.get("lat", el.get("center", {}).get("lat"))
+        lon = el.get("lon", el.get("center", {}).get("lon"))
+        if lat is None or lon is None:
+            continue
+        places.append({"name": tags.get("name", ""), "kind": classify(tags), "lat": float(lat), "lon": float(lon)})
+    return places
+
+
+def fetch(lat: float, lon: float, radius_km: float, urls=OVERPASS_URLS, timeout: int = 90) -> list[dict]:
+    """Try each public Overpass server in turn. Raises RuntimeError if all fail."""
+    body = urllib.parse.urlencode({"data": build_query(lat, lon, radius_km)}).encode()
+    ua = f"SurplusLink/1.0 ({config.GEOCODE_CONTACT or 'student project'})"
+    errors = []
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, data=body, headers={"User-Agent": ua})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return parse_elements(json.load(resp))
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+    raise RuntimeError("All Overpass servers failed. " + " | ".join(errors))
+
+
+def save(places: list[dict], city: str, radius_km: float) -> None:
+    payload = {"fetched_at": datetime.now().isoformat(timespec="seconds"), "city": city, "radius_km": radius_km,
+               "source": "OpenStreetMap contributors (ODbL)", "places": places}
+    config.PLACES_FILE.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def load() -> dict | None:
+    try:
+        return json.loads(config.PLACES_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def refresh() -> int:
+    """Fetch for the configured coverage city and cache it. Returns the number of places."""
+    lat, lon = config.CITY_PRESETS[config.COVERAGE_CITY]
+    places = fetch(lat, lon, config.COVERAGE_RADIUS_KM)
+    save(places, config.COVERAGE_CITY, config.COVERAGE_RADIUS_KM)
+    return len(places)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\records.py ===
+"""Surplus food record in the layout of FSSAI Schedule II.
+
+The Food Safety and Standards (Recovery and Distribution of Surplus Food) Regulations, 2019 ask the
+food donor and the surplus food distribution organisation to keep a record with twelve items.
+This module fills those twelve items from what was entered in the app and renders a one-page PDF.
+It is a convenience copy, not a legal certificate: check the current regulation text and keep a
+signed copy.
+"""
+import html
+from datetime import datetime
+from io import BytesIO
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+from core.db import now
+
+NOT_RECORDED = "Not recorded"
+NOT_YET = "Not yet recorded"
+
+
+def _dt(value: datetime | None, fallback: str = NOT_YET) -> str:
+    return f"{value:%d %b %Y, %H:%M}" if value else fallback
+
+
+def _org(user, address: str | None, fssai_label: str) -> str:
+    parts = [user.display_name]
+    if address:
+        parts.append(address)
+    line = ", ".join(parts)
+    extra = []
+    if getattr(user, "fssai_number", None):
+        extra.append(f"{fssai_label}: {user.fssai_number}")
+    if getattr(user, "darpan_id", None):
+        extra.append(f"NGO Darpan ID: {user.darpan_id}")
+    return line + ("\n" + "; ".join(extra) if extra else "")
+
+
+def schedule2_rows(listing) -> list[tuple[str, str]]:
+    """The twelve items, in the order of the schedule."""
+    donor, ngo = listing.donor, listing.ngo
+    donation_date = listing.picked_up_at or listing.claimed_at or listing.created_at
+    return [
+        ("Name and address of the food donor organisation", _org(donor, listing.address, "FSSAI licence or registration")),
+        ("Name and address of the surplus food distribution organisation",
+         _org(ngo, ngo.address, "FSSAI registration") if ngo is not None else "Not yet claimed"),
+        ("Donation date", _dt(donation_date)),
+        ("Name of the food product (item)", f"{listing.title} ({listing.category})"),
+        ("Batch number of food product (item)", listing.batch_ref or "Not assigned"),
+        ("Date of manufacturing (date and time prepared)", _dt(listing.cooked_at)),
+        ("Best before date or expiry date", f"{_dt(listing.safe_until)} (planning limit set in SurplusLink)"),
+        ("Quantity donated by food donor", f"{listing.quantity_meals} meals"),
+        ("Temperature of food", f"{listing.temperature_c:.1f} degrees C" if listing.temperature_c is not None else NOT_RECORDED),
+        ("Quantity distributed by surplus food distribution organisation",
+         f"{listing.qty_distributed} meals" if listing.qty_distributed is not None else NOT_YET),
+        ("Area where food is distributed", listing.area_distributed or NOT_YET),
+        ("Date of distribution", _dt(listing.delivered_at)),
+    ]
+
+
+def _p(text: str, style) -> Paragraph:
+    return Paragraph(html.escape(text).replace("\n", "<br/>"), style)
+
+
+def schedule2_pdf(listing) -> bytes:
+    base = ParagraphStyle("base", fontName="Helvetica", fontSize=9.5, leading=13)
+    bold = ParagraphStyle("bold", parent=base, fontName="Helvetica-Bold")
+    small = ParagraphStyle("small", parent=base, fontSize=8, leading=11, textColor=colors.HexColor("#555555"))
+    title = ParagraphStyle("title", parent=base, fontName="Helvetica-Bold", fontSize=15, leading=19)
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm, topMargin=1.8 * cm,
+                            bottomMargin=1.6 * cm, title=f"Surplus food record {listing.batch_ref or listing.id}")
+    story = [
+        _p("Record of surplus food", title),
+        _p("Laid out in the format of Schedule II, Food Safety and Standards (Recovery and Distribution of Surplus Food) "
+           "Regulations, 2019", small),
+        Spacer(1, 4),
+        _p(f"Record reference: {listing.batch_ref or listing.id}", bold),
+        Spacer(1, 10),
+    ]
+    data = [[_p("No.", bold), _p("Item", bold), _p("Entry", bold)]]
+    for i, (label, value) in enumerate(schedule2_rows(listing), 1):
+        data.append([_p(str(i), base), _p(label, base), _p(value, base)])
+    table = Table(data, colWidths=[1.1 * cm, 6.6 * cm, 9.3 * cm], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#9AA5AB")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8ECEE")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story += [table, Spacer(1, 26)]
+
+    sign = Table([[_p("Signature of donor representative", small), _p("Signature of distribution organisation representative", small)],
+                  [_p("Name and date:", small), _p("Name and date:", small)]],
+                 colWidths=[8.5 * cm, 8.5 * cm], rowHeights=[1.6 * cm, 0.7 * cm])
+    sign.setStyle(TableStyle([("LINEABOVE", (0, 0), (0, 0), 0.5, colors.black), ("LINEABOVE", (1, 0), (1, 0), 0.5, colors.black),
+                              ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    story += [sign, Spacer(1, 18),
+              _p(f"Prepared by SurplusLink on {now():%d %b %Y, %H:%M} from information entered by the donor and the NGO. "
+                 "The expiry entry is a planning limit used by this tool, not a figure set by the regulation. "
+                 "This sheet does not replace the regulation or legal advice. Please keep a signed copy.", small)]
+    doc.build(story)
+    return buf.getvalue()
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\safety.py ===
+"""Food-safety timing.
+
+IMPORTANT: the hours below are conservative illustrative defaults for a demo, NOT legal or
+medical advice. Before real-world use, check them against FSSAI guidance (including its
+rules on recovery of surplus food) and with your NGO partners.
+"""
+from datetime import datetime, timedelta
+
+SAFE_HOURS = {
+    "Cooked meal (rice, curry, etc.)": 4,
+    "Dairy-based dishes": 3,
+    "Bakery / snacks": 8,
+    "Raw fruits & vegetables": 24,
+    "Packaged / sealed food": 72,
+}
+
+
+def compute_safe_until(category: str, cooked_at: datetime) -> datetime:
+    return cooked_at + timedelta(hours=SAFE_HOURS.get(category, 3))
+
+
+def minutes_left(until: datetime, at: datetime) -> int:
+    return int((until - at).total_seconds() // 60)
+
+
+def format_minutes(minutes: int) -> str:
+    if minutes <= 0:
+        return "expired"
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m:02d}m left" if h else f"{m}m left"
+
+
+def format_duration(seconds: int) -> str:
+    """90 -> '90 seconds', 900 -> '15 minutes', 3600 -> '1 hour'."""
+    if seconds < 120:
+        return f"{seconds} seconds"
+    minutes = round(seconds / 60)
+    if minutes < 120:
+        return f"{minutes} minutes"
+    return f"{round(minutes / 60)} hours"
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\simulation.py ===
+"""Does learning from offer outcomes help? A transparent simulation.
+
+Every NGO has hidden behaviour (how often it stays silent, how often it accepts when it does respond, how
+quickly). Two policies face exactly the same random outcomes for exactly the same listings:
+
+  fixed     asks the NGOs in order of distance, always
+  learning  adds a penalty for NGOs that tend to waste time, learned only from what it has seen so far
+
+The numbers are synthetic. They show whether the idea works under stated assumptions; they are not
+evidence about real NGOs.
+"""
+from __future__ import annotations
+
+import random
+import statistics
+
+from core import learning
+
+
+def _outcomes(rng: random.Random, ngos: list[dict], timeout: float) -> list[tuple[str, float]]:
+    """For one listing: what each NGO would do if asked. ('silent'|'declined'|'accepted', minutes taken)."""
+    out = []
+    for n in ngos:
+        if rng.random() < n["p_silent"]:
+            out.append(("silent", timeout))
+            continue
+        minutes = min(timeout, rng.expovariate(1 / n["resp_mean"]))
+        out.append(("accepted" if rng.random() < n["p_accept"] else "declined", minutes))
+    return out
+
+
+def _run(policy: str, listings: list[dict], ngos: list[dict], timeout: float) -> list[dict]:
+    history = {i: learning.NgoHistory() for i in range(len(ngos))}
+    results = []
+    for L in listings:
+        scores = []
+        for i in range(len(ngos)):
+            s = L["dist"][i]
+            if policy == "learning":
+                s += learning.wait_penalty_km(learning.expected_wait_minutes(history[i], timeout))
+            scores.append((s, i))
+        waited, claimed, asked = 0.0, False, 0
+        for _s, i in sorted(scores):
+            kind, minutes = L["outcome"][i]
+            asked += 1
+            h = history[i]
+            if kind == "accepted":
+                waited += minutes
+                h.accepted += 1
+                h.accept_minutes += minutes
+                claimed = True
+                break
+            waited += minutes
+            h.declined += kind == "declined"
+            h.expired += kind == "silent"
+            h.fail_minutes += minutes
+        results.append({"minutes": waited, "first_try": claimed and asked == 1, "claimed": claimed})
+    return results
+
+
+def _summary(results: list[dict]) -> dict:
+    minutes = sorted(r["minutes"] for r in results)
+    return {
+        "mean_minutes": statistics.mean(minutes),
+        "p90_minutes": minutes[int(0.9 * (len(minutes) - 1))],
+        "first_offer_accepted": sum(r["first_try"] for r in results) / len(results),
+        "fell_through": sum(not r["claimed"] for r in results) / len(results),
+    }
+
+
+def simulate(n_listings: int = 400, n_ngos: int = 6, timeout_min: float = 15.0, seed: int = 1) -> dict:
+    rng = random.Random(seed)
+    ngos = [{"p_silent": rng.uniform(0.05, 0.6), "p_accept": rng.uniform(0.5, 0.95), "resp_mean": rng.uniform(1.5, 8.0)}
+            for _ in range(n_ngos)]
+    listings = [{"dist": [rng.uniform(0.5, 12.0) for _ in range(n_ngos)], "outcome": _outcomes(rng, ngos, timeout_min)}
+                for _ in range(n_listings)]
+    fixed = _run("fixed", listings, ngos, timeout_min)
+    learned = _run("learning", listings, ngos, timeout_min)
+    block = max(n_listings // 4, 1)
+    curve = [{"listings": f"{i + 1}-{i + block}",
+              "fixed": statistics.mean(r["minutes"] for r in fixed[i:i + block]),
+              "learning": statistics.mean(r["minutes"] for r in learned[i:i + block])}
+             for i in range(0, n_listings - block + 1, block)]
+    return {"fixed": _summary(fixed), "learning": _summary(learned), "curve": curve,
+            "assumptions": {"listings": n_listings, "ngos": n_ngos, "timeout_min": timeout_min, "seed": seed}}
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\style.css ===
+@import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;500;600;700&family=Source+Serif+4:wght@500;600;700&display=swap');
+
+:root {
+  --sans: "Source Sans 3", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --ink: #1B2630;
+  --muted: #5E6B73;
+  --rule: #D3D9DC;
+  --surface: #FFFFFF;
+  --accent: #23405F;
+  --ok: #2F6B4F;
+  --warn: #9A6200;
+  --bad: #9E3427;
+}
+
+/* Type */
+.stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea, .stApp button, .stApp th, .stApp td { font-family: var(--sans); }
+.stApp h1, .stApp h2, .stApp h3, .stApp h4 { font-family: var(--serif); color: var(--ink); letter-spacing: 0; }
+.stApp [data-testid="stHeading"] h2 { font-size: 1.45rem; font-weight: 600; }
+.stApp [data-testid="stHeading"] h3 { font-size: 1.15rem; font-weight: 600; margin-top: 0.4rem; }
+
+/* Layout */
+.stApp [data-testid="stMainBlockContainer"] { max-width: 1100px; margin: 0 auto; padding-top: 2.5rem; }
+.stApp [data-testid="stSidebar"] { border-right: 1px solid var(--rule); }
+#MainMenu, footer, [data-testid="stAppDeployButton"], [data-testid="stDecoration"] { display: none !important; }
+
+/* Page header */
+.stApp .ph { border-bottom: 1px solid var(--rule); padding-bottom: 0.9rem; margin-bottom: 1.5rem; }
+.stApp .ph h1 { font-size: 1.95rem; font-weight: 600; line-height: 1.2; margin: 0; padding: 0; }
+.stApp .ph p { color: var(--muted); margin: 0.4rem 0 0; max-width: 64ch; }
+
+/* Figures: numbers set in a row, no boxes */
+.stApp .figures { display: flex; flex-wrap: wrap; margin: 0 0 1.6rem; border-top: 1px solid var(--ink); }
+.stApp .fig { padding: 0.7rem 2rem 0.2rem 0; margin-right: 2rem; min-width: 8rem; }
+.stApp .fig + .fig { border-left: 1px solid var(--rule); padding-left: 1.5rem; }
+.stApp .fig .k { color: var(--muted); font-size: 0.85rem; }
+.stApp .fig .v { font-family: var(--serif); font-size: 2rem; font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums lining-nums; }
+
+/* Welcome page */
+.stApp .wordmark { font-family: var(--serif); font-weight: 700; font-size: 1.15rem; color: var(--accent); margin-bottom: 2.2rem; }
+.stApp .intro h1 { font-size: 2.45rem; font-weight: 600; line-height: 1.15; margin: 0 0 1rem; padding: 0; max-width: 22ch; }
+.stApp .intro p { color: var(--muted); font-size: 1.05rem; max-width: 52ch; margin: 0 0 1.2rem; }
+.stApp .proc { list-style: none; counter-reset: p; margin: 1.8rem 0 0; padding: 0; max-width: 54ch; border-top: 1px solid var(--ink); }
+.stApp .proc li { counter-increment: p; display: grid; grid-template-columns: 2rem 1fr; padding: 0.7rem 0; margin: 0; border-bottom: 1px solid var(--rule); }
+.stApp .proc li::before { content: counter(p); font-family: var(--serif); font-weight: 600; color: var(--accent); }
+.stApp .intro .note { font-size: 0.95rem; margin-top: 1.2rem; }
+
+/* Listing as a specification sheet */
+.stApp .lhead { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+.stApp .ltitle { display: flex; align-items: center; font-size: 1.08rem; font-weight: 600; }
+.stApp .lsub { color: var(--muted); font-size: 0.92rem; margin-top: 0.1rem; }
+.stApp .lspec { display: flex; flex-wrap: wrap; gap: 0.5rem 2.2rem; margin: 0.75rem 0 0.85rem; padding: 0; }
+.stApp .lspec div { margin: 0; }
+.stApp .lspec dt { color: var(--muted); font-size: 0.78rem; font-weight: 400; margin: 0; }
+.stApp .lspec dd { font-size: 1rem; font-weight: 600; margin: 0; font-variant-numeric: tabular-nums; }
+.stApp .rail { height: 4px; background: var(--rule); }
+.stApp .rail > div { height: 100%; background: var(--accent); }
+.stApp .rail-warn > div { background: var(--warn); }
+.stApp .rail-bad > div { background: var(--bad); }
+.stApp .rail-text { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.82rem; color: var(--muted); margin-top: 0.35rem; font-variant-numeric: tabular-nums; }
+[data-testid="stVerticalBlockBorderWrapper"]:has(.lrow) { border-radius: 2px; border-color: var(--rule); background: var(--surface); }
+
+/* Veg and non-veg marks, as printed on Indian food packaging */
+.stApp .vm { display: inline-block; position: relative; width: 13px; height: 13px; border: 2px solid currentColor; box-sizing: border-box; margin-right: 0.6rem; flex: none; }
+.stApp .vm::after { content: ""; position: absolute; inset: 2px; border-radius: 50%; background: currentColor; }
+.stApp .vm-veg { color: var(--ok); }
+.stApp .vm-nonveg { color: #8A3B12; }
+
+/* Status: a small square and plain words */
+.stApp .status { font-size: 0.84rem; font-weight: 600; white-space: nowrap; }
+.stApp .status::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 0.45rem; background: currentColor; }
+.stApp .status-open { color: var(--accent); }
+.stApp .status-claimed { color: var(--warn); }
+.stApp .status-transit { color: var(--accent); }
+.stApp .status-done { color: var(--ok); }
+.stApp .status-muted { color: var(--muted); }
+
+/* Timeline of a listing */
+.stApp .tl { list-style: none; margin: 0.4rem 0 0.6rem 0.25rem; padding: 0; border-left: 1px solid var(--rule); }
+.stApp .tl li { display: grid; grid-template-columns: 5.6rem 1fr; gap: 0.6rem; position: relative; padding: 0.28rem 0 0.28rem 1rem; margin: 0; font-size: 0.93rem; }
+.stApp .tl li::before { content: ""; position: absolute; left: -4px; top: 0.78rem; width: 7px; height: 7px; background: var(--ink); }
+.stApp .tl .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+.stApp .tl li.live::before { background: var(--warn); }
+.stApp .tl li.live .e { font-weight: 600; }
+
+/* Sidebar account block */
+.stApp .acct { padding: 0.2rem 0 0.9rem; margin-bottom: 0.8rem; border-bottom: 1px solid var(--rule); }
+.stApp .acct-name { font-weight: 600; }
+.stApp .acct-role { color: var(--muted); font-size: 0.88rem; margin-bottom: 0.35rem; }
+
+/* Native components, flattened */
+.stApp button[data-testid^="stBaseButton"] { border-radius: 2px; font-weight: 600; }
+.stApp [data-baseweb="input"], .stApp [data-baseweb="textarea"], .stApp [data-baseweb="select"] > div { border-radius: 2px; }
+.stApp [data-testid="stAlert"] { border-radius: 2px; }
+.stApp [data-testid="stForm"] { border-radius: 2px; border-color: var(--rule); }
+.stApp button[data-baseweb="tab"] { font-weight: 600; }
+.stApp [data-testid="stExpander"] { border-radius: 2px; border-color: var(--rule); }
+
+@media (max-width: 760px) {
+  .stApp .intro h1 { font-size: 1.9rem; }
+  .stApp .ph h1 { font-size: 1.6rem; }
+  .stApp .fig + .fig { border-left: 0; padding-left: 0; }
+  .stApp .lhead { flex-direction: column; gap: 0.2rem; }
+}
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\ui.py ===
+"""Shared Streamlit helpers: setup, stylesheet, sidebar, and the small HTML pieces used by the pages.
+
+Everything that comes from a user is escaped with esc() before it goes into HTML.
+"""
+import html
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+from sqlalchemy import select, update
+
+from core import config, geocode, matching, safety
+from core.db import Notification, User, init_db, now, session_scope
+
+APP_NAME = "SurplusLink"
+ROLE_LABEL = {"donor": "Food donor", "ngo": "NGO", "volunteer": "Volunteer", "admin": "Administrator"}
+STATUS_LABEL = {"open": "Open", "claimed": "Claimed", "picked_up": "In transit",
+                "delivered": "Delivered", "expired": "Expired"}
+_STATUS_TONE = {"open": "open", "claimed": "claimed", "picked_up": "transit", "delivered": "done", "expired": "muted"}
+_last_tick = {"t": 0.0}
+
+
+def esc(text) -> str:
+    return html.escape("" if text is None else str(text), quote=True)
+
+
+@st.cache_resource
+def _boot() -> bool:
+    init_db()
+    return True
+
+
+def run_tick(force: bool = False) -> None:
+    """Expire stale listings and escalate unanswered offers, at most once per TICK_SECONDS."""
+    if force or time.time() - _last_tick["t"] >= config.TICK_SECONDS:
+        _last_tick["t"] = time.time()
+        with session_scope() as s:
+            matching.tick(s)
+
+
+def setup() -> None:
+    """Call once, first, from the entry point."""
+    icon = None
+    favicon = config.BASE_DIR / "assets" / "favicon.png"
+    if favicon.exists():
+        from PIL import Image
+
+        icon = Image.open(favicon)
+    st.set_page_config(page_title=APP_NAME, page_icon=icon, layout="wide")
+    _boot()
+    run_tick()
+    css = Path(__file__).with_name("style.css").read_text(encoding="utf-8")
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+
+# ---------- session ----------
+
+def current_user() -> User | None:
+    uid = st.session_state.get("user_id")
+    if not uid:
+        return None
+    with session_scope() as s:
+        return s.get(User, uid)
+
+
+def logout() -> None:
+    st.session_state.pop("user_id", None)
+
+
+def require_role(user: User | None, roles: list[str]) -> None:
+    if user is None or (user.role not in roles and user.role != "admin"):
+        st.error("You do not have access to this page.")
+        st.stop()
+
+
+# ---------- page furniture ----------
+
+def sidebar(user: User) -> None:
+    with st.sidebar:
+        status = ""
+        if user.role == "ngo":
+            status = status_label("delivered" if user.verified else "claimed", "Approved" if user.verified else "Awaiting approval")
+        st.markdown(
+            f'<div class="acct"><div class="acct-name">{esc(user.display_name)}</div>'
+            f'<div class="acct-role">{ROLE_LABEL[user.role]}</div>{status}</div>', unsafe_allow_html=True)
+        with session_scope() as s:
+            notes = s.scalars(select(Notification).where(Notification.user_id == user.id)
+                              .order_by(Notification.id.desc()).limit(8)).all()
+        unread = sum(not n.is_read for n in notes)
+        with st.expander(f"Notifications ({unread} unread)" if unread else "Notifications", expanded=bool(unread)):
+            if not notes:
+                st.caption("Nothing yet.")
+            for n in notes:
+                st.caption(f"{'Unread. ' if not n.is_read else ''}{n.created_at:%d %b, %H:%M}  \n{n.message}")
+            if unread and st.button("Mark all as read", key="mark_read"):
+                with session_scope() as s:
+                    s.execute(update(Notification).where(Notification.user_id == user.id).values(is_read=True))
+                st.rerun()
+        if st.button("Sign out"):
+            logout()
+            st.rerun()
+
+
+def page_header(title: str, subtitle: str | None = None) -> None:
+    sub = f"<p>{esc(subtitle)}</p>" if subtitle else ""
+    st.markdown(f'<div class="ph"><h1>{esc(title)}</h1>{sub}</div>', unsafe_allow_html=True)
+
+
+def verification_notice(user: User) -> None:
+    if user.role == "ngo" and not user.verified:
+        st.warning("Your NGO account is waiting for administrator approval. You can look around, "
+                   "but you cannot claim food until it is approved.")
+
+
+def figures(items: list[tuple[str, object]]) -> None:
+    """A row of labelled numbers separated by hairlines."""
+    cells = "".join(f'<div class="fig"><div class="k">{esc(k)}</div><div class="v">{esc(v)}</div></div>' for k, v in items)
+    st.markdown(f'<div class="figures">{cells}</div>', unsafe_allow_html=True)
+
+
+# ---------- HTML pieces (single-line strings: indented lines would render as code in markdown) ----------
+
+def status_label(status: str, text: str | None = None) -> str:
+    tone = _STATUS_TONE.get(status, "muted")
+    return f'<span class="status status-{tone}">{esc(text or STATUS_LABEL.get(status, status))}</span>'
+
+
+def veg_mark(veg: bool) -> str:
+    kind, label = ("veg", "Vegetarian") if veg else ("nonveg", "Non-vegetarian")
+    return f'<span class="vm vm-{kind}" role="img" aria-label="{label}" title="{label}"></span>'
+
+
+def countdown(until: datetime, at: datetime | None = None) -> str:
+    secs = int((until - (at or now())).total_seconds())
+    if secs <= 0:
+        return "expired"
+    minutes, seconds = divmod(secs, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+def listing_html(l, *, distance_km: float | None = None, show_status: bool = False, show_donor: bool = True,
+                 offer_expires: datetime | None = None, at: datetime | None = None) -> str:
+    """One listing as a small specification sheet with the safe-time rail underneath."""
+    at = at or now()
+    total = max((l.safe_until - l.cooked_at).total_seconds(), 1.0)
+    left_s = (l.safe_until - at).total_seconds()
+    frac = min(max(left_s / total, 0.0), 1.0)
+    tone = "ok" if frac >= 0.5 else "warn" if frac >= 0.25 else "bad"
+    left_min = int(left_s // 60)
+    remaining = "Safe time has ended" if left_min <= 0 else safety.format_minutes(left_min)
+
+    sub = ([esc(l.donor.display_name)] if show_donor else []) + [esc(l.address)]
+    spec = [("Meals", str(l.quantity_meals))]
+    if distance_km is not None:
+        spec.append(("Distance", f"{distance_km:.1f} km"))
+    spec.append(("Planning limit", f"{l.safe_until:%H:%M}"))
+    if l.status == "open":
+        spec.append(("Collect by", f"{l.pickup_by:%H:%M}"))
+    if offer_expires is not None:
+        spec.append(("Offer expires in", countdown(offer_expires, at)))
+    if l.temperature_c is not None:
+        spec.append(("Packed at", f"{l.temperature_c:.0f} C"))
+    spec_html = "".join(f"<div><dt>{esc(k)}</dt><dd>{esc(v)}</dd></div>" for k, v in spec)
+    status = f'<div class="lstatus">{status_label(l.status)}</div>' if show_status else ""
+
+    return (
+        f'<div class="lrow"><div class="lhead"><div class="ltitle">{veg_mark(l.veg)}<span>{esc(l.title)}</span></div>{status}</div>'
+        f'<div class="lsub">{", ".join(sub)}</div><dl class="lspec">{spec_html}</dl>'
+        f'<div class="rail rail-{tone}" role="img" aria-label="{frac * 100:.0f} percent of planning time remaining">'
+        f'<div style="width:{frac * 100:.0f}%"></div></div>'
+        f'<div class="rail-text"><span>Time remaining against the planning limit</span><span>{remaining}</span></div></div>'
+    )
+
+
+def timeline_html(events: list[tuple[datetime, str]], pending=None, at: datetime | None = None) -> str:
+    """Journey of a listing. `pending` is the open Offer, shown last with a live countdown."""
+    at = at or now()
+
+    def stamp(dt: datetime) -> str:
+        return f"{dt:%H:%M:%S}" if dt.date() == at.date() else f"{dt:%d %b %H:%M}"
+
+    items = [f'<li><span class="t">{stamp(t)}</span><span class="e">{esc(text)}</span></li>' for t, text in events]
+    if pending is not None:
+        items.append(f'<li class="live"><span class="t">Now</span><span class="e">Waiting for {esc(pending.ngo.display_name)}. '
+                     f'Offer expires in {countdown(pending.expires_at, at)}</span></li>')
+    return f'<ol class="tl">{"".join(items)}</ol>'
+
+
+def rank_table(rows: list[dict]) -> pd.DataFrame:
+    """The working behind an NGO ranking, one row per NGO (from matching.rank_details)."""
+    return pd.DataFrame([{
+        "NGO": r["ngo"].display_name,
+        "Distance (km)": r["distance"],
+        "Fits the batch": "yes" if r["capacity_ok"] else "no",
+        "Own vehicle": "yes" if r["vehicle"] else "no",
+        "Past offers accepted": f"{r['history'].accepted} of {r['history'].total}",
+        "Estimated chance of accepting": f"{r['p_accept']:.0%}",
+        "Expected wait (min)": round(r["wait_min"], 1),
+        "Score (lower is better)": r["score"],
+    } for r in rows])
+
+
+RANK_NOTE = ("Score = distance in km, plus 15 if the NGO cannot take the whole batch, minus 4 if it has its own vehicle, "
+             "plus a waiting penalty learned from how it handled earlier offers (silent, declined, or accepted, and how fast). "
+             "NGOs with no history get the same neutral penalty. The table is recalculated whenever an offer ends.")
+
+
+# ---------- inputs ----------
+
+def location_input(prefix: str, label: str = "Address", default: tuple[float, float] | None = None):
+    """Address search with a manual fallback. Returns (address_text, lat, lon)."""
+    addr = st.text_input(label, key=f"{prefix}_addr", placeholder="Building, street, area, city")
+    found_key = f"{prefix}_found"
+    if st.button("Find on map", key=f"{prefix}_find"):
+        res = geocode.geocode(addr)
+        if res:
+            st.session_state[found_key] = (res["lat"], res["lon"], res["name"], addr)
+            st.session_state.pop(f"{prefix}_miss", None)
+        else:
+            st.session_state.pop(found_key, None)
+            st.session_state[f"{prefix}_miss"] = True
+    found = st.session_state.get(found_key)
+    if found and found[3] != addr:
+        st.caption("The address has changed since the last search. Press Find on map again.")
+        found = None
+    missed = st.session_state.get(f"{prefix}_miss", False)
+    if missed and not found:
+        st.warning("No match found for that address. Add the area and city, or set the location below.")
+
+    cities = list(config.CITY_PRESETS)
+    with st.expander("Choose a city or enter coordinates instead", expanded=bool(missed and not found)):
+        city = st.selectbox("City", cities, index=cities.index(config.COVERAGE_CITY), key=f"{prefix}_city")
+        start = default if default else config.CITY_PRESETS[city]
+        c1, c2 = st.columns(2)
+        lat_m = c1.number_input("Latitude", value=float(start[0]), format="%.5f", key=f"{prefix}_lat_{city}")
+        lon_m = c2.number_input("Longitude", value=float(start[1]), format="%.5f", key=f"{prefix}_lon_{city}")
+
+    if found:
+        lat, lon = found[0], found[1]
+        st.caption(f"Matched to: {found[2]}")
+        st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}), latitude="lat", longitude="lon", size=40, zoom=14, height=220)
+    else:
+        lat, lon = lat_m, lon_m
+        st.caption(f"No address match is in use. The position is {city} unless you edited the coordinates, "
+                   "so distances will be approximate.")
+    st.caption(geocode.ATTRIBUTION)
+    return addr, lat, lon
+
+
+def save_photo(uploaded) -> str | None:
+    if uploaded is None:
+        return None
+    ext = uploaded.name.rsplit(".", 1)[-1].lower() if "." in uploaded.name else "jpg"
+    path = config.PHOTO_DIR / f"{uuid.uuid4().hex}.{ext}"
+    path.write_bytes(uploaded.getbuffer())
+    return str(path)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\core\__init__.py ===
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\scripts\fetch_places.py ===
+"""Download kitchens and venues around the coverage city from OpenStreetMap and cache them.
+
+Run from the project folder, with internet access:   py scripts/fetch_places.py
+The Coverage page reads data/places.json. Public Overpass servers are sometimes busy: try again later.
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core import config, places  # noqa: E402
+
+if __name__ == "__main__":
+    print(f"Fetching places within {config.COVERAGE_RADIUS_KM} km of {config.COVERAGE_CITY}...")
+    try:
+        count = places.refresh()
+    except RuntimeError as exc:
+        print(exc)
+        sys.exit(1)
+    print(f"Saved {count} places to {config.PLACES_FILE}")
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\tests\test_core.py ===
+"""Run with:  pytest   (uses a throwaway SQLite file, never your real data)."""
+import os
+import tempfile
+from datetime import timedelta
+
+# Must be set BEFORE importing anything from core.
+_tmp = tempfile.mkdtemp()
+os.environ["DATABASE_URL"] = f"sqlite:///{_tmp}/test.db"
+os.environ["OFFER_TIMEOUT_MIN"] = "15"
+
+import pytest  # noqa: E402
+
+from core import forecast, geocode, impact, listings, matching, notify, places, records, safety  # noqa: E402
+from core.auth import authenticate, register_user  # noqa: E402
+from core.db import Base, Listing, Offer, User, engine, init_db, now, session_scope  # noqa: E402
+from core.geo import haversine_km  # noqa: E402
+
+BASE = (12.97, 77.59)
+
+
+@pytest.fixture(autouse=True)
+def fresh_db():
+    Base.metadata.drop_all(engine)
+    init_db()
+
+
+def make_world(s):
+    donor = register_user(s, email="d@x.com", password="secret1", name="Hotel", role="donor",
+                          address="a", lat=BASE[0], lon=BASE[1])
+    near = register_user(s, email="n1@x.com", password="secret1", name="Near NGO", role="ngo",
+                         lat=BASE[0] + 0.01, lon=BASE[1], capacity_meals=100, has_vehicle=True)
+    far = register_user(s, email="n2@x.com", password="secret1", name="Far NGO", role="ngo",
+                        lat=BASE[0] + 0.1, lon=BASE[1], capacity_meals=100)
+    near.verified = far.verified = True
+    s.flush()
+    return donor, near, far
+
+
+def post(s, donor, **kw):
+    args = dict(title="Biryani", category="Cooked meal (rice, curry, etc.)", veg=True, quantity_meals=50,
+                address="a", lat=BASE[0], lon=BASE[1], cooked_at=now() - timedelta(minutes=20), available_hours=2)
+    args.update(kw)
+    return listings.create_listing(s, donor, **args)
+
+
+def test_auth():
+    with session_scope() as s:
+        register_user(s, email="A@x.com", password="secret1", name="A", role="donor")
+        assert authenticate(s, "a@x.com", "secret1") is not None
+        assert authenticate(s, "a@x.com", "wrong") is None
+        with pytest.raises(ValueError):
+            register_user(s, email="a@x.com", password="secret1", name="A", role="donor")
+
+
+def test_ngo_needs_verification():
+    with session_scope() as s:
+        ngo = register_user(s, email="n@x.com", password="secret1", name="N", role="ngo")
+        assert ngo.verified is False
+
+
+def test_nearest_ngo_is_offered_first():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        listing = post(s, donor)
+        offer = s.query(Offer).filter_by(listing_id=listing.id).one()
+        assert offer.ngo_id == near.id
+
+
+def test_only_one_claim_wins():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        listing = post(s, donor)
+        lid = listing.id
+        listing.visible_to_all = True
+        assert listings.claim_listing(s, lid, near)[0] is True
+        assert listings.claim_listing(s, lid, far)[0] is False
+
+
+def test_escalation_after_timeout_then_open_to_all():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        near_id, far_id = near.id, far.id
+        lid = post(s, donor).id
+        s.query(Offer).update({Offer.expires_at: now() - timedelta(minutes=1)})
+    with session_scope() as s:
+        matching.tick(s)
+        assert {o.ngo_id for o in s.query(Offer).all()} == {near_id, far_id}  # second NGO now asked
+        s.query(Offer).filter_by(status="pending").update({Offer.expires_at: now() - timedelta(minutes=1)})
+    with session_scope() as s:
+        matching.tick(s)
+        assert s.get(Listing, lid).visible_to_all is True
+
+
+def test_unsafe_food_is_rejected():
+    with session_scope() as s:
+        donor, *_ = make_world(s)
+        with pytest.raises(ValueError):
+            post(s, donor, cooked_at=now() - timedelta(hours=3, minutes=50))  # 4h food, nearly spoiled
+
+
+def test_full_lifecycle_and_impact():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        lid = post(s, donor, quantity_meals=40).id
+        assert listings.claim_listing(s, lid, near)[0]
+        assert listings.mark_delivered(s, lid, near)[0] is False  # must be picked up first
+        assert listings.mark_picked_up(s, lid, near)[0]
+        assert listings.mark_delivered(s, lid, near)[0]
+        stats = impact.stats(s)
+        assert stats["meals"] == 40 and stats["deliveries"] == 1
+
+
+def test_expiry_housekeeping():
+    with session_scope() as s:
+        donor, *_ = make_world(s)
+        lid = post(s, donor).id
+        s.get(Listing, lid).pickup_by = now() - timedelta(minutes=1)
+    with session_scope() as s:
+        assert matching.tick(s)["expired_listings"] == 1
+        assert s.get(Listing, lid).status == "expired"
+
+
+def test_forecast_and_safety_and_geo():
+    today = now()
+    rows = [(today - timedelta(days=7 * k), 100) for k in range(1, 4)]
+    expected, n = forecast.forecast_meals(rows, today.date())
+    assert expected == 100 and n == 3
+    assert forecast.forecast_meals([], today.date()) == (None, 0)
+    assert safety.format_minutes(75) == "1h 15m left" and safety.format_minutes(0) == "expired"
+    assert 110 < haversine_km(0, 0, 1, 0) < 112
+
+
+# ---------------- cascade, record, alerts, parsing ----------------
+
+def test_cascade_is_visible_in_the_timeline():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        near_id = near.id
+        lid = post(s, donor).id
+        s.query(Offer).update({Offer.expires_at: now() - timedelta(seconds=1)})
+    with session_scope() as s:
+        matching.tick(s)
+        texts = [txt for _, txt in listings.timeline(s, s.get(Listing, lid))]
+        assert any("Offered to Near NGO" in x for x in texts)
+        assert any("Near NGO did not respond" in x for x in texts)
+        assert any("Offered to Far NGO" in x for x in texts)
+        first = s.query(Offer).filter_by(ngo_id=near_id).one()
+        assert first.status == "expired" and first.resolved_at is not None
+        assert matching.pending_offer(s, lid).ngo.display_name == "Far NGO"
+
+
+def test_delivery_completes_the_schedule_2_record():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        donor.fssai_number, near.darpan_id = "DONOR-LIC-1", "DARPAN-1"
+        lid = post(s, donor, quantity_meals=40, temperature_c=68.0).id
+        assert listings.claim_listing(s, lid, near)[0]
+        assert listings.mark_picked_up(s, lid, near)[0]
+        ok, _ = listings.mark_delivered(s, lid, near, quantity_distributed=35, area="Ward 5")
+        assert ok
+        listing = s.get(Listing, lid)
+        rows = dict(records.schedule2_rows(listing))
+        assert len(rows) == 12
+        assert rows["Temperature of food"] == "68.0 degrees C"
+        assert rows["Quantity distributed by surplus food distribution organisation"] == "35 meals"
+        assert rows["Area where food is distributed"] == "Ward 5"
+        assert rows["Batch number of food product (item)"].startswith("SL-")
+        assert "DONOR-LIC-1" in rows["Name and address of the food donor organisation"]
+        assert "DARPAN-1" in rows["Name and address of the surplus food distribution organisation"]
+        assert records.schedule2_pdf(listing).startswith(b"%PDF")
+
+
+def test_cannot_distribute_more_than_was_donated():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        lid = post(s, donor, quantity_meals=10).id
+        listings.claim_listing(s, lid, near)
+        listings.mark_picked_up(s, lid, near)
+        ok, msg = listings.mark_delivered(s, lid, near, quantity_distributed=999)
+        assert ok is False and "between 0 and 10" in msg
+
+
+def test_heads_up_goes_to_the_nearest_ngos_first():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        names = matching.heads_up(s, donor, 60, "tomorrow")
+        assert names[0] == "Near NGO" and "Far NGO" in names
+
+
+def test_repeat_donation_availability_follows_the_food_type(monkeypatch):
+    monkeypatch.setitem(safety.SAFE_HOURS, "Dairy-based dishes", 2)  # pretend this type keeps for only 2 hours
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        post(s, donor, category="Dairy-based dishes")
+        again = listings.repost_last(s, donor)
+        assert (again.pickup_by - now()).total_seconds() <= 1 * 3600 + 5  # not the fixed 2 hours any more
+
+
+def test_timeout_can_be_set_in_seconds():
+    from core import config
+    assert config.OFFER_TIMEOUT_SEC == 15 * 60  # default comes from OFFER_TIMEOUT_MIN
+    assert safety.format_duration(90) == "90 seconds" and safety.format_duration(900) == "15 minutes"
+
+
+def test_geocode_parser_and_phone_format():
+    assert geocode.parse_result([{"lat": "12.30", "lon": "76.64", "display_name": "Mysuru"}]) == \
+        {"lat": 12.3, "lon": 76.64, "name": "Mysuru"}
+    assert geocode.parse_result([]) is None and geocode.parse_result([{"lat": "x"}]) is None
+    assert notify.normalize_phone("98450 12345") == "+919845012345"
+    assert notify.normalize_phone("+1 (415) 555-0100") == "+14155550100"
+
+
+def test_places_parser_classifies_and_uses_centres():
+    data = {"elements": [
+        {"type": "node", "lat": 12.30, "lon": 76.64, "tags": {"amenity": "restaurant", "name": "A"}},
+        {"type": "way", "center": {"lat": 12.31, "lon": 76.65}, "tags": {"tourism": "hotel", "name": "B"}},
+        {"type": "node", "tags": {"amenity": "canteen"}},  # no coordinates: skipped
+    ]}
+    out = places.parse_elements(data)
+    assert [p["kind"] for p in out] == ["Restaurant or cafe", "Hotel or lodging"]
+    assert "around:8000,12.2958,76.6394" in places.build_query(12.2958, 76.6394, 8)
+
+
+def test_forecast_gives_a_range():
+    today = now()
+    rows = [(today - timedelta(days=7 * k), 100 + 20 * k) for k in range(1, 4)]
+    d = forecast.forecast_detail(rows, today.date())
+    assert d["expected"] == 140 and d["days"] == 3 and d["basis"].startswith("same weekday")
+    assert round(d["low"], 1) == 114.4 and round(d["high"], 1) == 165.6
+
+
+# ---------------- learning from offers
+
+def test_adaptive_ranking_demotes_an_ngo_that_ignores_offers():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        twin = register_user(s, email="twin@x.com", password="secret1", name="Twin NGO", role="ngo",
+                             lat=near.lat, lon=near.lon, capacity_meals=100, has_vehicle=True)
+        twin.verified = True
+        s.flush()
+        listing = post(s, donor)
+        for k in range(6):  # "Near NGO" never answered six earlier offers
+            start = now() - timedelta(hours=k + 2)
+            s.add(Offer(listing_id=listing.id, ngo_id=near.id, status="expired", offered_at=start,
+                        expires_at=start + timedelta(minutes=15), resolved_at=start + timedelta(minutes=15)))
+        s.flush()
+        ranking = matching.rank_details(s, listing)
+        assert [r["ngo"].display_name for r in ranking][:2] == ["Twin NGO", "Near NGO"]
+        assert ranking[1]["penalty"] > ranking[0]["penalty"] and ranking[1]["p_accept"] < 0.5
+
+
+def test_offer_outcomes_are_counted_per_ngo():
+    from core import intelligence
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        listing = post(s, donor)
+        base = now() - timedelta(hours=1)
+        s.add(Offer(listing_id=listing.id, ngo_id=far.id, status="accepted", offered_at=base,
+                    expires_at=base + timedelta(minutes=15), resolved_at=base + timedelta(minutes=3)))
+        s.add(Offer(listing_id=listing.id, ngo_id=far.id, status="declined", offered_at=base,
+                    expires_at=base + timedelta(minutes=15), resolved_at=base + timedelta(minutes=5)))
+        s.flush()
+        h = intelligence.ngo_history(s)[far.id]
+        assert (h.accepted, h.declined, h.expired) == (1, 1, 0) and h.accept_minutes == 3 and h.fail_minutes == 5
+
+
+def test_demo_data_gives_matching_something_to_learn_from():
+    from core import demo, intelligence, learning
+    with session_scope() as s:
+        demo.seed(s)
+        names = {u.id: u.name for u in s.query(User).filter_by(role="ngo")}
+        hist = intelligence.ngo_history(s)
+        chance = {names[i]: learning.acceptance_probability(h.accepted, h.total) for i, h in hist.items()}
+        assert chance["Annapurna Food Bank (demo)"] > chance["Hope Kitchen Trust (demo)"]
+        assert demo.seed_if_empty(s) is False  # a second call changes nothing
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\tests\test_learning.py ===
+"""Tests for the learning, forecast, simulation and assistant code. None of these need a database."""
+import os
+from datetime import date, datetime, timedelta
+
+import pytest
+
+from core import assistant, learning, simulation
+
+
+# ---------------- learning from offer outcomes
+
+def test_unknown_ngo_starts_at_fifty_percent_and_moves_with_evidence():
+    assert learning.acceptance_probability(0, 0) == 0.5
+    assert learning.acceptance_probability(10, 10) == pytest.approx(12 / 14)
+    assert learning.acceptance_probability(0, 10) == pytest.approx(2 / 14)
+    assert learning.acceptance_probability(1, 1) < learning.acceptance_probability(10, 10)  # one success proves little
+
+
+def test_an_ngo_that_never_answers_has_a_longer_expected_wait():
+    reliable = learning.NgoHistory(accepted=9, declined=1, accept_minutes=27, fail_minutes=3)
+    silent = learning.NgoHistory(expired=10, fail_minutes=150)
+    unknown = learning.NgoHistory()
+    wait = lambda h: learning.expected_wait_minutes(h, timeout_min=15)
+    assert wait(reliable) < wait(unknown) < wait(silent)
+    assert learning.wait_penalty_km(10) == 5.0
+
+
+def test_two_ngos_with_no_history_get_the_same_penalty():
+    a, b = learning.NgoHistory(), learning.NgoHistory()
+    assert learning.expected_wait_minutes(a, 15) == learning.expected_wait_minutes(b, 15)
+
+
+# ---------------- forecast
+
+def weekly(values_by_age):
+    today = datetime(2026, 11, 20, 21)
+    return [(today - timedelta(days=age), meals) for age, meals in values_by_age]
+
+
+def test_days_without_donations_count_as_zero():
+    rows = weekly([(5, 100), (1, 100)])  # donations on 15 and 19 November
+    days, y = learning.daily_totals(rows, date(2026, 11, 20))
+    assert len(days) == 6 and list(y) == [100.0, 0.0, 0.0, 0.0, 100.0, 0.0]  # 20 November had none
+
+
+def test_weekday_forecast_averages_the_same_weekday_and_gives_a_range():
+    rows = weekly([(7, 120), (14, 140), (21, 160)])
+    f = learning.weekday_forecast(rows, date(2026, 11, 20) + timedelta(days=0), as_of=date(2026, 11, 19))
+    assert f["expected"] == 140 and f["days"] == 3
+    assert round(f["low"], 1) == 114.4 and round(f["high"], 1) == 165.6
+    assert f["basis"].startswith("same weekday")
+
+
+def test_forecast_refuses_to_guess_from_too_little_history():
+    assert learning.weekday_forecast(weekly([(1, 50), (2, 60)]), date(2026, 11, 21)) is None
+    assert learning.backtest(weekly([(1, 50), (2, 60)]), date(2026, 11, 20)) is None
+
+
+def test_backtest_compares_against_the_overall_average():
+    # Weekends are twice as busy, so a weekday-aware forecast should beat "every day looks the same".
+    rows = []
+    for age in range(1, 57):
+        d = datetime(2026, 11, 20, 21) - timedelta(days=age)
+        rows.append((d, 160 if d.weekday() >= 5 else 80))
+    bt = learning.backtest(rows, date(2026, 11, 20))
+    assert bt["days_tested"] >= 5 and bt["mae_weekday"] < bt["mae_naive"] and bt["improvement_pct"] > 0
+
+
+# ---------------- simulation
+
+def test_learning_waits_less_on_average_than_distance_only():
+    fixed = learned = 0.0
+    for seed in range(1, 6):
+        r = simulation.simulate(seed=seed)
+        fixed += r["fixed"]["mean_minutes"]
+        learned += r["learning"]["mean_minutes"]
+    assert learned < fixed
+
+
+def test_simulation_is_repeatable_and_reports_its_assumptions():
+    a, b = simulation.simulate(seed=3), simulation.simulate(seed=3)
+    assert a["fixed"] == b["fixed"] and a["learning"] == b["learning"]
+    assert a["assumptions"]["listings"] == 400 and len(a["curve"]) == 4
+
+
+# ---------------- language-model assistant (validation only; no network)
+
+def test_assistant_keeps_valid_values_and_drops_bad_ones():
+    reply = '```json\n{"title": "Veg pulao", "category": "Cooked meal (rice, curry, etc.)", "veg": true, "quantity_meals": 40, ' \
+            '"cooked_time": "20:15", "temperature_c": 70, "notes": null}\n```'
+    v = assistant.parse_response(reply)
+    assert v["title"] == "Veg pulao" and v["quantity_meals"] == 40 and v["veg"] is True
+    assert (v["cooked_time"].hour, v["cooked_time"].minute) == (20, 15) and v["temperature_c"] == 70.0 and "notes" not in v
+
+    bad = assistant.validate({"title": "x", "category": "Rocket fuel", "quantity_meals": 10 ** 9, "cooked_time": "25:99",
+                              "temperature_c": 999, "veg": "yes"})
+    assert bad == {"title": "x"}
+
+
+def test_assistant_fails_safely():
+    with pytest.raises(assistant.AssistantError):
+        assistant.parse_response("Sorry, I cannot help with that.")
+    with pytest.raises(assistant.AssistantError):
+        assistant.parse_response('{"category": "Rocket fuel"}')  # nothing usable
+    saved = os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        assert assistant.available() is False
+        with pytest.raises(assistant.AssistantError):
+            assistant.parse_listing_text("40 plates of biryani")
+    finally:
+        if saved is not None:
+            os.environ["ANTHROPIC_API_KEY"] = saved
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\tests\__init__.py ===
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\activity.py ===
+"""Each role's own listings: journey, delivery details, and the downloadable record."""
+import streamlit as st
+from sqlalchemy import select
+
+from core import matching, ui
+from core.db import Listing, session_scope
+from core.listings import mark_delivered, mark_picked_up, timeline
+from core.records import schedule2_pdf
+
+user = ui.current_user()
+ui.require_role(user, ["donor", "ngo", "volunteer"])
+
+TITLES = {
+    "donor": ("My donations", "Everything you have posted, the journey of each listing, and its record."),
+    "ngo": ("My pickups", "Food you have claimed. Update each one as it moves, then confirm delivery."),
+    "volunteer": ("My jobs", "Transport jobs you have taken."),
+    "admin": ("Activity", "Recent listings."),
+}
+ui.page_header(*TITLES[user.role])
+
+with session_scope() as s:
+    q = select(Listing).order_by(Listing.id.desc())
+    if user.role == "donor":
+        q = q.where(Listing.donor_id == user.id)
+    elif user.role == "ngo":
+        q = q.where(Listing.ngo_id == user.id)
+    elif user.role == "volunteer":
+        q = q.where(Listing.volunteer_id == user.id)
+    mine = s.scalars(q.limit(40)).all()
+    journeys = {l.id: (timeline(s, l), matching.pending_offer(s, l.id) if l.status == "open" else None) for l in mine}
+
+if not mine:
+    st.info({"donor": "You have not posted anything yet.",
+             "ngo": "Food you claim will appear here.",
+             "volunteer": "Jobs you take will appear here."}.get(user.role, "Nothing to show yet."))
+    st.stop()
+
+
+def record_button(l: Listing) -> None:
+    if l.ngo_id:
+        st.download_button("Download record (PDF)", data=schedule2_pdf(l), file_name=f"record-{l.batch_ref or l.id}.pdf",
+                           mime="application/pdf", key=f"rec{l.id}")
+
+
+for l in mine:
+    events, pending = journeys[l.id]
+    with st.container(border=True):
+        st.markdown(ui.listing_html(l, show_status=True, show_donor=(user.role != "donor")), unsafe_allow_html=True)
+        if user.role != "donor":
+            st.caption(f"Pickup contact: {l.donor.phone}" if l.donor.phone else "No phone number on file for this donor.")
+        with st.expander("Journey"):
+            st.markdown(ui.timeline_html(events, pending), unsafe_allow_html=True)
+
+        if user.role in ("ngo", "volunteer"):
+            if l.status == "claimed" and st.button("Mark as collected", key=f"pu{l.id}", type="primary"):
+                with session_scope() as s:
+                    ok, msg = mark_picked_up(s, l.id, user)
+                if ok:
+                    st.rerun()
+                st.error(msg)
+            if l.status == "picked_up":
+                st.markdown("**Delivery details for the record**")
+                d1, d2 = st.columns([1, 2])
+                qty = d1.number_input("Meals distributed", min_value=0, max_value=l.quantity_meals,
+                                      value=l.quantity_meals, key=f"qty{l.id}")
+                area = d2.text_input("Area where food is distributed", key=f"area{l.id}",
+                                     placeholder="Locality or institution")
+                if st.button("Confirm delivery", key=f"dl{l.id}", type="primary"):
+                    with session_scope() as s:
+                        ok, msg = mark_delivered(s, l.id, user, quantity_distributed=int(qty), area=area)
+                    if ok:
+                        st.rerun()
+                    st.error(msg)
+        record_button(l)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\admin.py ===
+"""Administration: approve NGOs, review accounts and listings, run housekeeping, test alerts."""
+import pandas as pd
+import streamlit as st
+from sqlalchemy import select
+
+from core import intelligence, learning, config, matching, notify, places, ui
+from core.db import Listing, User, session_scope
+
+user = ui.current_user()
+ui.require_role(user, ["admin"])
+ui.page_header("Administration", "Approve NGOs and look after the platform.")
+
+with session_scope() as s:
+    pending = s.scalars(select(User).where(User.role == "ngo", User.verified.is_(False))).all()
+    approved = s.scalars(select(User).where(User.role == "ngo", User.verified.is_(True))).all()
+    users = s.scalars(select(User).order_by(User.id)).all()
+    listings = s.scalars(select(Listing).order_by(Listing.id.desc()).limit(100)).all()
+
+st.subheader(f"NGOs awaiting approval ({len(pending)})")
+st.caption("An NGO Darpan ID is self-declared, so treat it as something to check, not as proof. "
+           "Look up the ID on the NGO Darpan portal and compare the name, and check the FSSAI registration and the "
+           "organisation's registration documents before approving.")
+if not pending:
+    st.info("No NGOs are waiting for approval.")
+for u in pending:
+    with st.container(border=True):
+        st.markdown(f"**{u.display_name}**")
+        st.caption(f"{u.email}, {u.phone or 'no phone'}. {u.address or 'No address'}. Capacity {u.capacity_meals} meals. "
+                   f"Own vehicle: {'yes' if u.has_vehicle else 'no'}.")
+        st.markdown(f"FSSAI registration: **{u.fssai_number or 'not given'}**. NGO Darpan ID: **{u.darpan_id or 'not given'}**.")
+        checked = st.checkbox("I have checked this NGO's registration details", key=f"chk{u.id}")
+        if st.button("Approve", key=f"v{u.id}", type="primary", disabled=not checked):
+            with session_scope() as s:
+                s.get(User, u.id).verified = True
+            st.rerun()
+
+st.subheader(f"Approved NGOs ({len(approved)})")
+for u in approved:
+    c1, c2 = st.columns([5, 1])
+    c1.write(f"{u.display_name} ({u.email})  FSSAI: {u.fssai_number or '-'}  Darpan: {u.darpan_id or '-'}")
+    if c2.button("Revoke", key=f"r{u.id}"):
+        with session_scope() as s:
+            s.get(User, u.id).verified = False
+        st.rerun()
+
+st.subheader("Tools")
+t1, t2, t3, t4 = st.tabs(["Housekeeping", "Test an alert", "Coverage data", "What matching has learned"])
+with t1:
+    st.caption("Expires listings past their pickup window and passes unanswered offers to the next NGO. "
+               "This also runs automatically while the app is open.")
+    if st.button("Run housekeeping now"):
+        with session_scope() as s:
+            result = matching.tick(s)
+        st.success(f"Expired {result['expired_listings']} listings and escalated {result['escalated']} offers.")
+with t2:
+    st.caption("Sends one message through Twilio. With the WhatsApp sandbox, the phone must first join the sandbox "
+               "by sending the join code shown in your Twilio console.")
+    phone = st.text_input("Phone number with country code", placeholder="+91...")
+    if st.button("Send test message"):
+        ok, detail = notify.send_test(phone)
+        (st.success if ok else st.warning)(detail)
+with t3:
+    data = places.load()
+    st.caption("Kitchens and venues from OpenStreetMap, used by the Coverage page. "
+               + (f"Last fetched {data['fetched_at']}, {len(data['places'])} places." if data else "Nothing fetched yet."))
+    if st.button("Fetch coverage data now"):
+        with st.spinner("Contacting the public Overpass servers. This can take up to a minute."):
+            try:
+                count = places.refresh()
+                st.success(f"Saved {count} places.")
+            except RuntimeError as exc:
+                st.error(str(exc))
+
+with t4:
+    with session_scope() as s:
+        hist = intelligence.ngo_history(s)
+        names = {u.id: u.display_name for u in s.scalars(select(User).where(User.role == "ngo")).all()}
+    timeout_min = config.OFFER_TIMEOUT_SEC / 60
+    rows = []
+    for ngo_id, name in names.items():
+        h = hist.get(ngo_id, learning.NgoHistory())
+        rows.append({"NGO": name, "Offers": h.total, "Accepted": h.accepted, "Declined": h.declined, "No response": h.expired,
+                     "Estimated chance of accepting": f"{learning.acceptance_probability(h.accepted, h.total):.0%}",
+                     "Expected wait (min)": round(learning.expected_wait_minutes(h, timeout_min), 1)})
+    st.caption("Learned from the outcome of every past offer. With few offers the estimate stays close to 50 percent, so one bad day "
+               "does not sink an NGO. Adaptive matching is " + ("on." if config.ADAPTIVE_MATCHING else "off (set ADAPTIVE_MATCHING=true)."))
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+    else:
+        st.info("No NGOs yet.")
+
+tab_users, tab_listings = st.tabs(["All accounts", "Recent listings"])
+with tab_users:
+    st.dataframe(pd.DataFrame([{"ID": u.id, "Name": u.display_name, "Email": u.email, "Role": ui.ROLE_LABEL[u.role],
+                                "Approved": "Yes" if u.verified else "No"} for u in users]), hide_index=True)
+with tab_listings:
+    st.dataframe(pd.DataFrame([{"ID": l.id, "Batch": l.batch_ref or "", "Food": l.title, "Meals": l.quantity_meals,
+                                "Status": ui.STATUS_LABEL[l.status], "Donor": l.donor.display_name,
+                                "NGO": l.ngo.display_name if l.ngo else ""} for l in listings]), hide_index=True)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\coverage.py ===
+"""Coverage: kitchens and venues from OpenStreetMap next to the NGOs registered on the platform."""
+import pandas as pd
+import streamlit as st
+from sqlalchemy import select
+
+from core import config, places, ui
+from core.db import User, session_scope
+from core.geo import haversine_km
+
+ui.page_header("Coverage", f"Kitchens and venues within {config.COVERAGE_RADIUS_KM:g} km of {config.COVERAGE_CITY}, "
+                           "and the NGOs registered here.")
+data = places.load()
+if not data:
+    st.info("No coverage data has been fetched yet. Run `py scripts/fetch_places.py` once with an internet connection, "
+            "or ask an administrator to fetch it from the Administration page.")
+    st.stop()
+
+centre = config.CITY_PRESETS.get(data["city"], config.CITY_PRESETS[config.COVERAGE_CITY])
+with session_scope() as s:
+    ngos = [u for u in s.scalars(select(User).where(User.role == "ngo", User.verified.is_(True), User.lat.is_not(None))).all()
+            if haversine_km(centre[0], centre[1], u.lat, u.lon) <= data["radius_km"]]
+    donors = s.scalars(select(User).where(User.role == "donor")).all()
+
+pts = data["places"]
+kinds = pd.Series([p["kind"] for p in pts]).value_counts()
+ui.figures([("Kitchens and venues mapped", f"{len(pts):,}"), ("Approved NGOs on SurplusLink", len(ngos)),
+            ("Donors on SurplusLink", len(donors))])
+
+frame = pd.DataFrame(
+    [{"lat": p["lat"], "lon": p["lon"], "color": "#8793A0", "size": 40} for p in pts]
+    + [{"lat": u.lat, "lon": u.lon, "color": "#23405F", "size": 160} for u in ngos]
+)
+st.map(frame, latitude="lat", longitude="lon", color="color", size="size")
+st.caption("Grey points are kitchens and venues from OpenStreetMap. Dark points are approved NGOs on this platform.")
+
+st.subheader("What was mapped")
+st.dataframe(pd.DataFrame({"Type": kinds.index, "Count": kinds.values}), hide_index=True)
+st.caption(f"Map data from OpenStreetMap contributors (ODbL). Fetched {data['fetched_at']}. "
+           "OpenStreetMap is volunteer-edited and incomplete, so treat the counts as a lower bound.")
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\find_food.py ===
+"""Available food (NGOs) and transport jobs (volunteers)."""
+import os
+
+import pandas as pd
+import streamlit as st
+from sqlalchemy import select
+
+from core import config, ui
+from core.db import Listing, Offer, now, session_scope
+from core.geo import haversine_km
+from core.listings import claim_listing, decline_offer, take_transport
+
+user = ui.current_user()
+ui.require_role(user, ["ngo", "volunteer"])
+is_vol = user.role == "volunteer"
+
+ui.page_header(
+    "Transport jobs" if is_vol else "Available food",
+    "Food an NGO has claimed that still needs a driver." if is_vol else
+    "The best-matched NGO is asked first. Respond before the offer runs out, or it moves to the next NGO.",
+)
+ui.verification_notice(user)
+if user.role == "ngo" and not user.verified:
+    st.stop()
+
+
+def card(l: Listing, *, priority: bool, offer_expires=None) -> None:
+    dist = haversine_km(user.lat, user.lon, l.lat, l.lon) if user.lat is not None else None
+    has_photo = bool(l.photo_path and os.path.exists(l.photo_path))
+    with st.container(border=True):
+        left, right = st.columns([4, 1]) if has_photo else (st.container(), None)
+        with left:
+            st.markdown(ui.listing_html(l, distance_km=dist, offer_expires=offer_expires), unsafe_allow_html=True)
+            if l.description:
+                st.caption(l.description)
+            if is_vol:
+                st.caption(f"Deliver to {l.ngo.display_name}, {l.ngo.address or 'address on request'}")
+            b1, b2, _ = st.columns([1.3, 1, 3])
+            if is_vol:
+                if b1.button("Take this job", key=f"take{l.id}", type="primary"):
+                    with session_scope() as s:
+                        ok, msg = take_transport(s, l.id, user)
+                    st.session_state["flash"] = (ok, msg)
+                    st.rerun()
+            else:
+                if b1.button("Claim this food", key=f"claim{l.id}", type="primary"):
+                    with session_scope() as s:
+                        ok, msg = claim_listing(s, l.id, user)
+                    st.session_state["flash"] = (ok, msg)
+                    st.rerun()
+                if priority and b2.button("Decline", key=f"decl{l.id}"):
+                    with session_scope() as s:
+                        decline_offer(s, l.id, user)
+                    st.rerun()
+        if right is not None:
+            right.image(l.photo_path)
+
+
+@st.fragment(run_every=5)
+def board() -> None:
+    """Refreshes every 5 seconds so offers and their countdowns stay current."""
+    ui.run_tick()
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        (st.success if flash[0] else st.error)(flash[1])
+
+    n = now()
+    offers: dict[int, object] = {}
+    with session_scope() as s:
+        if is_vol:
+            jobs = s.scalars(select(Listing).where(Listing.status == "claimed", Listing.volunteer_id.is_(None))).all()
+            priority = [j for j in jobs if user.lat is None or
+                        haversine_km(user.lat, user.lon, j.lat, j.lon) <= config.VOLUNTEER_RADIUS_KM]
+            others: list[Listing] = []
+        else:
+            offers = {o.listing_id: o.expires_at for o in
+                      s.scalars(select(Offer).where(Offer.ngo_id == user.id, Offer.status == "pending"))}
+            open_ = s.scalars(select(Listing).where(Listing.status == "open", Listing.pickup_by > n)
+                              .order_by(Listing.safe_until)).all()
+            priority = [l for l in open_ if l.id in offers]
+            others = [l for l in open_ if (l.visible_to_all or config.DEMO_MODE) and l.id not in offers]
+
+    shown = priority + others
+    if shown:
+        with st.expander("Map", expanded=False):
+            st.map(pd.DataFrame({"lat": [l.lat for l in shown], "lon": [l.lon for l in shown]}),
+                   latitude="lat", longitude="lon", color="#23405F", size=120)
+
+    st.subheader(f"Jobs near you ({len(priority)})" if is_vol else f"Offered to you ({len(priority)})")
+    if not priority:
+        st.info("Nothing is waiting for you right now. This page updates on its own.")
+    for l in priority:
+        card(l, priority=True, offer_expires=offers.get(l.id))
+
+    if not is_vol:
+        st.subheader(f"Open to all NGOs ({len(others)})")
+        if not others:
+            st.info("When the NGO asked first does not respond in time, a listing moves to the next one, "
+                    "and finally to every NGO in range." +
+                    (" Demo mode is on, so every open listing is shown here immediately." if config.DEMO_MODE else ""))
+        for l in others:
+            card(l, priority=False)
+
+
+board()
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\impact.py ===
+"""Impact figures and a next-day surplus forecast."""
+from datetime import timedelta
+
+import pandas as pd
+import streamlit as st
+
+from core import config, forecast, impact, simulation, ui
+from core.db import now, session_scope
+
+user = ui.current_user()
+is_donor = user.role == "donor"
+ui.page_header("Impact", "Meals delivered, estimated food and emissions avoided, and the surplus we expect tomorrow.")
+
+scope_donor = user.id if is_donor else None
+with session_scope() as s:
+    totals = impact.stats(s, scope_donor)
+    series = impact.daily_series(s, 30, scope_donor)
+    board = impact.leaderboard(s)
+    check = forecast.platform_backtest(s, now().date())
+    tomorrow = (now() + timedelta(days=1)).date()
+    if is_donor:
+        f = forecast.donor_forecast_detail(s, user.id, tomorrow)
+        donors_counted = 1 if f["expected"] is not None else 0
+        expected = f["expected"]
+    else:
+        expected, donors_counted = forecast.platform_forecast(s, tomorrow)
+
+st.subheader("Your impact" if is_donor else "Platform impact")
+ui.figures([("Meals delivered", f"{totals['meals']:,}"), ("Food rescued (kg)", f"{totals['kg_food']:,}"),
+            ("CO2e avoided (kg)", f"{totals['co2e_kg']:,}"), ("Deliveries", totals["deliveries"])])
+st.caption(f"Estimates assume {config.KG_PER_MEAL} kg of food per meal and {config.CO2E_KG_PER_KG_FOOD} kg CO2e per kg of food. "
+           "Both are editable in core/config.py. They are rough figures, not measurements.")
+
+if len(series):
+    st.subheader("Meals delivered in the last 30 days")
+    st.bar_chart(series, color="#23405F")
+
+if not is_donor and board:
+    st.subheader("Top donors")
+    st.dataframe(pd.DataFrame([{"Rank": i, "Donor": name, "Meals delivered": meals}
+                               for i, (name, meals) in enumerate(board, 1)]), hide_index=True)
+
+st.subheader(f"Expected surplus tomorrow ({tomorrow:%A})")
+if expected is None:
+    st.info("There is not enough history yet. A forecast appears after a few days of donations.")
+else:
+    ui.figures([("Your expected surplus" if is_donor else "Expected across donors", f"about {round(expected)} meals")])
+    st.caption("Average of past totals for the same weekday, or the overall daily average while history is short."
+               + ("" if is_donor else f" Donors included: {donors_counted}."))
+
+st.subheader("Is the forecast any good?")
+if check is None:
+    st.caption("The forecast needs about three weeks of history before it can test itself.")
+else:
+    ui.figures([("Weekday forecast, average error", f"{check['mae_weekday']:.0f} meals a day"),
+                ("Overall average, average error", f"{check['mae_naive']:.0f} meals a day"),
+                ("Difference", f"{check['improvement_pct']:+.0f}%")])
+    st.caption(f"Each of the last {check['days_tested']} days was predicted using only earlier days, then compared with what happened. "
+               "The overall average assumes every day looks the same. A positive difference means the weekday forecast did better. "
+               "The demo history has a weekend effect built in, so on real data this number should be watched, not assumed.")
+
+st.subheader("Does learning from NGO behaviour help?")
+st.caption("Matching adds a waiting penalty for NGOs that often stay silent or decline, learned from past offers. "
+           "This simulation compares it with ranking by distance alone, on the same synthetic listings and the same hidden NGO behaviour.")
+if st.button("Run the simulation"):
+    sim = simulation.simulate()
+    f_, l_ = sim["fixed"], sim["learning"]
+    st.dataframe(pd.DataFrame([
+        {"Measure": "Average minutes until an NGO accepts", "Distance only": f"{f_['mean_minutes']:.1f}", "With learning": f"{l_['mean_minutes']:.1f}"},
+        {"Measure": "Slowest 10 percent, minutes", "Distance only": f"{f_['p90_minutes']:.1f}", "With learning": f"{l_['p90_minutes']:.1f}"},
+        {"Measure": "First NGO asked accepts", "Distance only": f"{f_['first_offer_accepted']:.0%}", "With learning": f"{l_['first_offer_accepted']:.0%}"},
+        {"Measure": "Nobody accepted; opened to all", "Distance only": f"{f_['fell_through']:.0%}", "With learning": f"{l_['fell_through']:.0%}"},
+    ]), hide_index=True)
+    st.line_chart(pd.DataFrame(sim["curve"]).set_index("listings"))
+    a = sim["assumptions"]
+    st.caption(f"{a['listings']} synthetic listings, {a['ngos']} NGOs, {a['timeout_min']:g}-minute offers. Each NGO was given hidden "
+               "habits (how often it is silent, how often it accepts, how quickly it answers). The result shows whether the idea works "
+               "under these assumptions. It is not evidence about real NGOs.")
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\overview.py ===
+"""Role-specific overview: the numbers that matter, and for donors the live journey of each listing."""
+from datetime import timedelta
+
+import streamlit as st
+from sqlalchemy import func, select
+
+from core import config, forecast, impact, matching, ui
+from core.db import Listing, Offer, User, now, session_scope
+from core.geo import haversine_km
+from core.listings import timeline
+
+user = ui.current_user()
+ui.page_header("Overview", f"{user.display_name}, {ui.ROLE_LABEL[user.role].lower()}")
+ui.verification_notice(user)
+
+ACTIVE = ["open", "claimed", "picked_up"]
+
+
+@st.fragment(run_every=5)
+def live_listings() -> None:
+    """Refreshes every 5 seconds and moves the cascade along, so offers can be watched passing from NGO to NGO."""
+    ui.run_tick()
+    at = now()
+    with session_scope() as s:
+        active = s.scalars(select(Listing).where(Listing.donor_id == user.id, Listing.status.in_(ACTIVE))
+                           .order_by(Listing.id.desc())).all()
+        blocks = [(l, timeline(s, l), matching.pending_offer(s, l.id) if l.status == "open" else None,
+                   matching.rank_details(s, l) if l.status == "open" else None) for l in active]
+    if not blocks:
+        st.info("You have no active listings.")
+    for l, events, pending, ranking in blocks:
+        with st.container(border=True):
+            st.markdown(ui.listing_html(l, show_status=True, show_donor=False, at=at), unsafe_allow_html=True)
+            st.markdown(ui.timeline_html(events, pending, at), unsafe_allow_html=True)
+            if ranking:
+                with st.expander("Why NGOs are asked in this order"):
+                    st.dataframe(ui.rank_table(ranking), hide_index=True)
+                    st.caption(ui.RANK_NOTE)
+
+
+def donor_view(s):
+    stats = impact.stats(s, user.id)
+    active = s.scalars(select(Listing).where(Listing.donor_id == user.id, Listing.status.in_(ACTIVE))).all()
+    ui.figures([("Meals delivered", stats["meals"]), ("Active listings", len(active)),
+                ("Waiting for an NGO", sum(l.status == "open" for l in active))])
+    st.subheader("Listings in progress")
+    live_listings()
+    st.page_link("views/post_food.py", label="Post surplus food")
+
+    st.subheader("Tomorrow")
+    tomorrow = (now() + timedelta(days=1)).date()
+    f = forecast.donor_forecast_detail(s, user.id, tomorrow)
+    if f["expected"] is None:
+        st.caption("There is not enough history for a forecast yet.")
+        return
+    expected = round(f["expected"])
+    how = (f"The range covers about 80 percent of the same-weekday totals in {f['days']} earlier weeks, counting days with no surplus."
+           if f["basis"].startswith("same weekday") else f"Based on {f['days']} days of history only, so treat it as rough.")
+    st.markdown(f"Expected surplus on {tomorrow:%A}: about **{expected} meals**, likely between {round(f['low'])} and "
+                f"{round(f['high'])}. {how}")
+    if st.button("Alert the nearest NGOs in advance"):
+        with session_scope() as s2:
+            names = matching.heads_up(s2, user, expected, f"on {tomorrow:%A}")
+        if names:
+            st.success("Heads-up sent to " + ", ".join(names) + ".")
+        else:
+            st.warning("No approved NGO with a saved location is in range.")
+
+
+def ngo_view(s):
+    n = now()
+    offered = set(s.scalars(select(Offer.listing_id).where(Offer.ngo_id == user.id, Offer.status == "pending")))
+    open_ = s.scalars(select(Listing).where(Listing.status == "open", Listing.pickup_by > n)).all()
+    priority = [l for l in open_ if l.id in offered]
+    others = [l for l in open_ if (l.visible_to_all or config.DEMO_MODE) and l.id not in offered]
+    active = s.scalar(select(func.count(Listing.id)).where(Listing.ngo_id == user.id,
+                                                           Listing.status.in_(["claimed", "picked_up"])))
+    ui.figures([("Offers waiting for you", len(priority)), ("Open to all NGOs", len(others)), ("Pickups in progress", active)])
+    st.page_link("views/find_food.py", label="Available food")
+    st.page_link("views/activity.py", label="My pickups")
+
+
+def volunteer_view(s):
+    jobs = s.scalars(select(Listing).where(Listing.status == "claimed", Listing.volunteer_id.is_(None))).all()
+    nearby = [j for j in jobs if user.lat is None or
+              haversine_km(user.lat, user.lon, j.lat, j.lon) <= config.VOLUNTEER_RADIUS_KM]
+    mine = s.scalar(select(func.count(Listing.id)).where(Listing.volunteer_id == user.id,
+                                                         Listing.status.in_(["claimed", "picked_up"])))
+    ui.figures([("Jobs near you", len(nearby)), ("Your jobs in progress", mine)])
+    st.page_link("views/find_food.py", label="Transport jobs")
+    st.page_link("views/activity.py", label="My jobs")
+
+
+def admin_view(s):
+    pending = s.scalar(select(func.count(User.id)).where(User.role == "ngo", User.verified.is_(False)))
+    open_now = s.scalar(select(func.count(Listing.id)).where(Listing.status == "open"))
+    stats = impact.stats(s)
+    ui.figures([("NGOs awaiting approval", pending), ("Open listings", open_now),
+                ("Meals delivered", stats["meals"]), ("Records available", stats["deliveries"])])
+    st.page_link("views/admin.py", label="Administration")
+
+
+with session_scope() as s:
+    {"donor": donor_view, "ngo": ngo_view, "volunteer": volunteer_view, "admin": admin_view}[user.role](s)
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\post_food.py ===
+"""Donors post surplus food, or repeat their last donation."""
+from datetime import datetime, timedelta
+
+import streamlit as st
+
+from core import assistant, config, matching, safety, ui
+from core.db import User, now, session_scope
+from core.listings import create_listing, repost_last
+from core.safety import format_duration
+
+user = ui.current_user()
+ui.require_role(user, ["donor"])
+ui.page_header("Post surplus food", "List what is left. The best-matched NGO is offered it straight away.")
+
+
+def first_offer_text(s, listing) -> str:
+    pending = matching.pending_offer(s, listing.id)
+    if pending is not None:
+        return f"First offer sent to {pending.ngo.display_name}, who has {format_duration(config.OFFER_TIMEOUT_SEC)} to respond."
+    return "No approved NGO is in range, so the listing is open to all NGOs."
+
+
+with st.container(border=True):
+    st.markdown("**Repeat your last donation**")
+    st.caption("Same details as your most recent listing, treated as cooked just now.")
+    if st.button("Repeat last donation"):
+        try:
+            with session_scope() as s:
+                listing = repost_last(s, user)
+                msg = f'Posted "{listing.title}", batch {listing.batch_ref}. {first_offer_text(s, listing)}'
+            st.success(msg)
+        except ValueError as exc:
+            st.error(str(exc))
+
+with st.expander("Details printed on your donation records"):
+    fssai = st.text_input("FSSAI licence or registration number", value=user.fssai_number or "", key="own_fssai")
+    if st.button("Save details"):
+        with session_scope() as s:
+            s.get(User, user.id).fssai_number = fssai.strip() or None
+        st.success("Saved.")
+
+# Defaults live in session state so the assistant can fill the form below before the widgets are drawn.
+st.session_state.setdefault("pf_qty", 50)
+st.session_state.setdefault("cooked_time", now().time().replace(second=0, microsecond=0))
+
+with st.expander("Describe the food in a sentence (optional)"):
+    if assistant.available():
+        st.caption("A language model suggests values for the form below. You check and correct them before posting. "
+                   "The text you type is sent to the Anthropic API, so leave out anything private.")
+        desc = st.text_area("Description", key="pf_desc", height=80,
+                            placeholder="For example: 40 plates of veg pulao and raita, cooked at 8:15 pm, packed at about 70 degrees")
+        if st.button("Fill the form"):
+            try:
+                values = assistant.parse_listing_text(desc)
+            except assistant.AssistantError as exc:
+                st.warning(str(exc))
+            else:
+                for field, key in {"title": "pf_title", "category": "pf_category", "quantity_meals": "pf_qty",
+                                   "cooked_time": "cooked_time", "temperature_c": "pf_temp", "notes": "pf_notes"}.items():
+                    if field in values:
+                        st.session_state[key] = values[field]
+                if "veg" in values:
+                    st.session_state["pf_diet"] = "Vegetarian" if values["veg"] else "Non-vegetarian"
+                st.session_state["pf_filled"] = True
+                st.rerun()
+    else:
+        st.caption("This is switched off. An administrator can enable it by setting ANTHROPIC_API_KEY.")
+if st.session_state.pop("pf_filled", False):
+    st.info("The form was filled from your description. Please check every field, especially the quantity and the cooked time, before posting.")
+
+st.subheader("New donation")
+st.markdown("**The food**")
+title = st.text_input("What is it?", key="pf_title", placeholder="For example: vegetable biryani and raita")
+c1, c2, c3 = st.columns(3)
+category = c1.selectbox("Food type", list(safety.SAFE_HOURS), key="pf_category")
+quantity = c2.number_input("Approximate meals", min_value=1, step=5, key="pf_qty")
+veg = c3.radio("Diet", ["Vegetarian", "Non-vegetarian"], horizontal=True, key="pf_diet") == "Vegetarian"
+description = st.text_area("Notes for the NGO", height=80, key="pf_notes", placeholder="Packaging, allergens, containers needed")
+
+st.markdown("**Timing and temperature**")
+t1, t2, t3, t4 = st.columns(4)
+cooked_time = t1.time_input("Cooked or prepared at", key="cooked_time")
+available_hours = t2.slider("Available for pickup (hours)", 0.5, 6.0, 2.0, 0.5)
+temperature = t3.number_input("Food temperature when packed (degrees C)", min_value=-30.0, max_value=120.0,
+                              value=None, step=1.0, placeholder="Optional", key="pf_temp",
+                              help="Part of the donation record. Measure with a food thermometer if you can.")
+event_type = t4.selectbox("Source", ["Regular service", "Buffet", "Wedding or event", "Conference", "Canteen"])
+st.caption(f"{category}: planning limit of {safety.SAFE_HOURS[category]} hours after cooking. This is a default used by this tool "
+           "to schedule pickups. It is not a regulatory limit, so follow your own food safety procedures.")
+
+st.markdown("**Pickup location**")
+use_saved = st.checkbox("Collect from my registered address", value=bool(user.lat))
+if use_saved and user.lat is not None:
+    address, lat, lon = user.address or "Registered address", user.lat, user.lon
+else:
+    address, lat, lon = ui.location_input("post", label="Pickup address")
+photo = st.file_uploader("Photo of the food (optional)", type=["jpg", "jpeg", "png"])
+
+if st.button("Post donation", type="primary"):
+    cooked_at = datetime.combine(now().date(), cooked_time)
+    if cooked_at > now():
+        cooked_at -= timedelta(days=1)
+    try:
+        with session_scope() as s:
+            listing = create_listing(
+                s, user, title=title, category=category, veg=veg, quantity_meals=int(quantity),
+                address=address, lat=lat, lon=lon, cooked_at=cooked_at, available_hours=available_hours,
+                description=description or None, event_type=event_type, photo_path=ui.save_photo(photo),
+                temperature_c=temperature,
+            )
+            left = safety.minutes_left(listing.safe_until, now())
+            msg = (f"Donation posted, batch {listing.batch_ref}. About {safety.format_minutes(left).replace(' left', '')} "
+                   f"remain against the planning limit. {first_offer_text(s, listing)}")
+        st.success(msg)
+    except ValueError as exc:
+        st.error(str(exc))
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\views\welcome.py ===
+"""Signed-out landing page: what the service does, plus sign in and registration."""
+import streamlit as st
+
+from core import config, impact, ui
+from core.auth import authenticate, register_user
+from core.db import session_scope
+from core.safety import format_duration
+
+ROLE_CHOICES = {"donor": "Food donor", "ngo": "NGO or food bank", "volunteer": "Volunteer driver"}
+ROLE_HELP = {
+    "donor": "Hotels, caterers, canteens and event kitchens with surplus cooked food.",
+    "ngo": "Organisations that distribute food to people in need. An administrator approves each NGO before it can claim.",
+    "volunteer": "Individuals with a vehicle who can move food from a donor to an NGO.",
+}
+
+with session_scope() as s:
+    totals = impact.stats(s)
+
+left, right = st.columns([6, 5], gap="large")
+
+with left:
+    note = (f'<p class="note"><b>{totals["meals"]:,}</b> meals delivered in {totals["deliveries"]:,} deliveries so far.</p>'
+            if totals["meals"] else "")
+    st.markdown(
+        '<div class="intro"><div class="wordmark">SurplusLink</div>'
+        "<h1>Surplus cooked food, matched to an NGO before it spoils.</h1>"
+        "<p>Kitchens list what is left, with the time it was cooked. The nearest NGO with room for it gets first refusal for "
+        f"{format_duration(config.OFFER_TIMEOUT_SEC)}. If it does not respond, the next NGO is asked. "
+        "Each delivery produces a record laid out in the format of FSSAI Schedule II.</p>"
+        '<ol class="proc">'
+        "<li><div><strong>List.</strong> The kitchen enters the food, quantity, time cooked and temperature.</div></li>"
+        "<li><div><strong>Offer.</strong> NGOs are ranked by distance, capacity and vehicle. The best match is asked first.</div></li>"
+        "<li><div><strong>Claim.</strong> The first NGO to accept gets the food. Only one claim can succeed.</div></li>"
+        "<li><div><strong>Collect.</strong> The NGO, or a volunteer driver, collects it and confirms.</div></li>"
+        "<li><div><strong>Record.</strong> The quantity and area distributed complete the record, which both sides can download.</div></li>"
+        f"</ol>{note}</div>",
+        unsafe_allow_html=True,
+    )
+
+with right:
+    with st.container(border=True):
+        tab_in, tab_up = st.tabs(["Sign in", "Create account"])
+
+        with tab_in:
+            with st.form("login", border=False):
+                email = st.text_input("Email")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Sign in", type="primary")
+            if submitted:
+                with session_scope() as s:
+                    u = authenticate(s, email, password)
+                    uid = u.id if u else None
+                if uid:
+                    st.session_state["user_id"] = uid
+                    st.rerun()
+                else:
+                    st.error("That email and password do not match an account.")
+
+        with tab_up:
+            role = st.radio("Account type", list(ROLE_CHOICES), format_func=ROLE_CHOICES.get, horizontal=True)
+            st.caption(ROLE_HELP[role])
+            name = st.text_input("Your name")
+            org = st.text_input("Organisation name" + (" (optional)" if role == "volunteer" else ""))
+            email_r = st.text_input("Email", key="reg_email")
+            phone = st.text_input("Phone", help="Include the country code, for example +91, so WhatsApp or SMS alerts can reach you.")
+            password_r = st.text_input("Password", type="password", key="reg_pw", help="At least 6 characters.")
+            fssai = darpan = None
+            capacity, vehicle = 0, False
+            if role == "donor":
+                fssai = st.text_input("FSSAI licence or registration number",
+                                      help="Printed on each donation record. You can add it later from the Post surplus food page.")
+            if role == "ngo":
+                fssai = st.text_input("FSSAI registration number", help="Distribution organisations are expected to be registered with FSSAI.")
+                darpan = st.text_input("NGO Darpan ID", help="The unique ID from the NITI Aayog NGO Darpan portal.")
+                capacity = st.number_input("Meals you can handle at once", min_value=0, value=100, step=10)
+                vehicle = st.checkbox("We have our own vehicle for pickups")
+            address, lat, lon = ui.location_input("reg", label="Address")
+            if st.button("Create account", type="primary"):
+                try:
+                    with session_scope() as s:
+                        u = register_user(
+                            s, email=email_r, password=password_r, name=name, role=role,
+                            org_name=org.strip() or None, phone=phone.strip() or None,
+                            address=address.strip() or None, lat=lat, lon=lon,
+                            capacity_meals=int(capacity), has_vehicle=vehicle,
+                            fssai_number=(fssai or "").strip() or None, darpan_id=(darpan or "").strip() or None,
+                        )
+                        uid = u.id
+                    st.session_state["user_id"] = uid
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\Home.py ===
+"""SurplusLink entry point: one-time setup, then a navigation menu that depends on who is signed in."""
+import streamlit as st
+
+from core import ui
+
+ui.setup()
+user = ui.current_user()
+
+if user is None:
+    nav = st.navigation([st.Page("views/welcome.py", title="Sign in", default=True)], position="hidden")
+else:
+    P = st.Page
+    overview = P("views/overview.py", title="Overview", default=True)
+    impact = P("views/impact.py", title="Impact", url_path="impact")
+    coverage = P("views/coverage.py", title="Coverage", url_path="coverage")
+    menus = {
+        "donor": [overview, P("views/post_food.py", title="Post surplus food", url_path="post-food"),
+                  P("views/activity.py", title="My donations", url_path="my-donations"), impact, coverage],
+        "ngo": [overview, P("views/find_food.py", title="Available food", url_path="available-food"),
+                P("views/activity.py", title="My pickups", url_path="my-pickups"), impact, coverage],
+        "volunteer": [overview, P("views/find_food.py", title="Transport jobs", url_path="transport-jobs"),
+                      P("views/activity.py", title="My jobs", url_path="my-jobs"), impact, coverage],
+        "admin": [overview, P("views/admin.py", title="Administration", url_path="administration"), impact, coverage],
+    }
+    nav = st.navigation(menus[user.role])
+    ui.sidebar(user)
+
+nav.run()
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\README.md ===
+# SurplusLink
+
+Hotels, caterers and event kitchens list surplus cooked food. The best-matched NGO is offered it first;
+if it does not respond in time, the offer moves to the next NGO. A volunteer or the NGO collects it, and every
+delivery produces a record laid out in the format of FSSAI Schedule II.
+
+## What it does
+
+- **Matching with a visible cascade.** NGOs are ranked by distance, capacity and vehicle. Each listing has a live
+  timeline showing every offer, who did not respond, and who claimed it.
+- **Address search.** Donors and NGOs find their address on a map (OpenStreetMap Nominatim) instead of picking a city.
+- **Surplus food record.** Donor licence and NGO registration numbers, batch reference, food temperature, quantity
+  distributed and area distributed are captured, and a PDF can be downloaded for each delivery.
+- **NGO approval checks.** NGOs give an FSSAI registration number and NGO Darpan ID; an administrator reviews them before
+  approving. Darpan IDs are self-declared, so they are something to check, not proof.
+- **Alerts.** In-app notifications always; SMS or WhatsApp through Twilio if configured. Donors can send a heads-up to
+  the nearest NGOs based on tomorrow's forecast.
+- **Coverage.** A map of kitchens and venues from OpenStreetMap next to the NGOs registered on the platform.
+- **Impact.** Meals delivered, estimated food and emissions avoided, and a next-day forecast with a range.
+
+## Where the intelligence is, and what it is not
+
+- **Matching that learns.** From every past offer (accepted, declined, or never answered, and how long it took) the app
+  estimates how likely each NGO is to accept and how long it typically wastes. That becomes a waiting penalty added to the
+  distance rule. Estimates are smoothed so a few offers do not decide anything. Each donor can see the working under
+  "Why NGOs are asked in this order", and Administration shows what has been learned. This is simple statistics (Bayesian
+  smoothing), not a neural network.
+- **A simulation of whether it helps.** On the Impact page, 400 synthetic listings are replayed under two policies,
+  distance only and distance plus learning, against identical hidden NGO behaviour. In five runs with different seeds the
+  learning policy waited less on average each time (by roughly 3 to 19 percent). The behaviour is invented, so this
+  shows the idea works under stated assumptions, not that real NGOs behave this way.
+- **A forecast that tests itself.** Tomorrow's surplus is the same-weekday average with days of no surplus counted as zero,
+  with a range. The Impact page back-tests it over the last two weeks against assuming every day is average. A regression on
+  weekday and trend was tried on demo-like data and did not beat the simple weekday average, so it is not used.
+- **An optional language-model assistant.** If `ANTHROPIC_API_KEY` is set, a donor can describe the food in a sentence and the
+  form is pre-filled. Every value is validated, the donor checks it before posting, and nothing is posted automatically.
+  The text typed is sent to the Anthropic API.
+- **Not AI:** the address search (OpenStreetMap), the distance formula, the safe-time table and the impact estimates are
+  ordinary rules and lookups. The demo history is synthetic.
+
+## Run it
+
+```bash
+python -m venv .venv
+# Windows:  .venv\Scripts\activate        macOS/Linux:  source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # Windows: copy .env.example .env   (then set ADMIN_PASSWORD)
+python seed_demo.py           # optional demo data (password demo123, every name ends in "(demo)")
+streamlit run Home.py         # http://localhost:8501
+python worker.py              # optional second terminal: keeps the cascade moving when nobody is browsing
+pytest                        # run the tests
+```
+
+An existing database is upgraded automatically on start: new columns are added in place.
+
+## Show the cascade
+
+1. In `.env` set `OFFER_TIMEOUT_SEC=90` and keep `DEMO_MODE=false`. Restart the app.
+2. Sign in as a donor in one window and as two NGOs in others (after seeding: `donor1@demo.com`, `ngo1@demo.com`,
+   `ngo2@demo.com`, password `demo123`).
+3. Post food as the donor. The Overview page shows the timeline updating every few seconds as the offer passes from one
+   NGO to the next.
+
+## WhatsApp alerts with the Twilio sandbox
+
+Set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and `TWILIO_FROM=whatsapp:+14155238886` (the sandbox number shown in your
+Twilio console), and `pip install twilio`. Each phone must first join the sandbox by sending the join code from the
+console. Then use Administration, Test an alert. Phone numbers need the country code, for example `+91...`.
+
+## Coverage map
+
+Run `py scripts/fetch_places.py` once with internet access, or use Administration, Coverage data. It saves
+`data/places.json`. The public Overpass servers are sometimes busy; try again later. Set `COVERAGE_CITY` and
+`COVERAGE_RADIUS_KM` to change the area.
+
+## Putting it online
+
+Streamlit Community Cloud wipes local files on restart, so use a hosted PostgreSQL database and set `DATABASE_URL`
+(starting `postgresql+psycopg2://`) in the app's Secrets together with `ADMIN_EMAIL` and `ADMIN_PASSWORD`. Set
+`SEED_DEMO_ON_EMPTY=true` if you want the first screen to show history. Photos are stored on local disk, so they do not
+survive a restart.
+
+## Layout
+
+```
+Home.py                  entry point: setup, then a role-based menu
+views/                   welcome, overview, post_food, find_food, activity, impact, coverage, admin
+core/                    db, auth, matching, listings, records, geocode, places, forecast, impact, notify, safety, ui
+core/style.css           the look; .streamlit/config.toml holds the base theme
+scripts/fetch_places.py  downloads the coverage data
+worker.py                background cascade and expiry (optional)
+seed_demo.py             demo data
+tests/                   pytest suite
+```
+
+## Limits to be honest about
+
+- The planning limits in `core/safety.py` are defaults used to schedule pickups. They are not regulatory limits. Food
+  safety remains the responsibility of the donor and the distribution organisation.
+- The record is laid out like Schedule II but is not a legal certificate. Check the current regulation text and keep a
+  signed copy.
+- Login is demo-grade: no email verification, password reset or attempt limits.
+- The forecast is a same-weekday average. It needs real history to mean anything.
+- The coverage counts come from OpenStreetMap, which is volunteer-edited and incomplete.
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\seed_demo.py ===
+"""Fill the database with demo accounts and eight weeks of history so every screen has data.
+
+Run once:  python seed_demo.py
+All demo accounts use the password demo123 and are labelled "(demo)". Re-running is safe.
+"""
+from core.db import init_db, session_scope
+from core.demo import seed_if_empty
+
+
+def main() -> None:
+    init_db()
+    with session_scope() as s:
+        created = seed_if_empty(s)
+    if created:
+        print("Demo data created. Sign in as donor1@demo.com, ngo1@demo.com or vol1@demo.com (password demo123).")
+    else:
+        print("Demo data already exists: nothing to do.")
+
+
+if __name__ == "__main__":
+    main()
+
+=== FILE: C:\Users\priya\Downloads\surpluslink\surpluslink\worker.py ===
+"""Optional background worker: expires listings and escalates unanswered offers every minute.
+
+The Streamlit app already runs the same housekeeping while someone has it open. Run this too
+(`python worker.py` in a second terminal) so escalation continues when nobody is browsing.
+"""
+from apscheduler.schedulers.blocking import BlockingScheduler
+
+from core import config, matching
+from core.db import init_db, session_scope
+
+
+def run_tick() -> None:
+    with session_scope() as s:
+        result = matching.tick(s)
+    if any(result.values()):
+        print("tick:", result)
+
+
+if __name__ == "__main__":
+    init_db()
+    scheduler = BlockingScheduler()
+    scheduler.add_job(run_tick, "interval", seconds=config.TICK_SECONDS, max_instances=1)
+    print("Worker running. Ctrl+C to stop.")
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+
