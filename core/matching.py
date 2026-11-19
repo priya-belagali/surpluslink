@@ -4,34 +4,50 @@ from types import SimpleNamespace
 
 from sqlalchemy import select, update
 
-from core import config
+from core import config, intelligence, learning
 from core.db import Listing, Offer, User, now
 from core.geo import haversine_km
 from core.notify import notify
 from core.safety import format_duration
 
 
-def rank_ngos(session, listing) -> list[tuple[User, float, float]]:
-    """Return [(ngo, score, distance_km)] best first. Lower score is better.
+def rank_details(session, listing) -> list[dict]:
+    """Every NGO in range with the working behind its score, best first. Lower score is better.
+
+    score = distance (km)
+            + 15 if the NGO cannot absorb the whole batch
+            - 4 if it has its own vehicle
+            + waiting penalty learned from how it handled past offers (when ADAPTIVE_MATCHING is on)
 
     `listing` only needs .lat, .lon and .quantity_meals, so a plain object works for forecasts.
     """
     ngos = session.scalars(
         select(User).where(User.role == "ngo", User.verified.is_(True), User.lat.is_not(None))
     ).all()
-    ranked = []
+    history = intelligence.ngo_history(session) if config.ADAPTIVE_MATCHING else {}
+    timeout_min = config.OFFER_TIMEOUT_SEC / 60
+    out = []
     for ngo in ngos:
         dist = haversine_km(listing.lat, listing.lon, ngo.lat, ngo.lon)
         if dist > config.MAX_MATCH_RADIUS_KM:
             continue
-        score = dist
-        if ngo.capacity_meals < listing.quantity_meals:
-            score += 15  # cannot absorb the whole batch: strongly deprioritise
-        if ngo.has_vehicle:
-            score -= 4  # can collect without waiting for a volunteer
-        ranked.append((ngo, round(score, 2), round(dist, 1)))
-    ranked.sort(key=lambda r: r[1])
-    return ranked
+        capacity_ok = ngo.capacity_meals >= listing.quantity_meals
+        score = dist + (0 if capacity_ok else 15) - (4 if ngo.has_vehicle else 0)
+        h = history.get(ngo.id, learning.NgoHistory())
+        wait = learning.expected_wait_minutes(h, timeout_min)
+        penalty = learning.wait_penalty_km(wait) if config.ADAPTIVE_MATCHING else 0.0
+        out.append({
+            "ngo": ngo, "distance": round(dist, 1), "capacity_ok": capacity_ok, "vehicle": ngo.has_vehicle,
+            "history": h, "p_accept": learning.acceptance_probability(h.accepted, h.total),
+            "wait_min": wait, "penalty": round(penalty, 2), "score": round(score + penalty, 2),
+        })
+    out.sort(key=lambda r: r["score"])
+    return out
+
+
+def rank_ngos(session, listing) -> list[tuple[User, float, float]]:
+    """Return [(ngo, score, distance_km)] best first."""
+    return [(r["ngo"], r["score"], r["distance"]) for r in rank_details(session, listing)]
 
 
 def pending_offer(session, listing_id: int) -> Offer | None:

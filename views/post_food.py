@@ -3,11 +3,10 @@ from datetime import datetime, timedelta
 
 import streamlit as st
 
-from core import matching, safety, ui
+from core import assistant, config, matching, safety, ui
 from core.db import User, now, session_scope
 from core.listings import create_listing, repost_last
 from core.safety import format_duration
-from core import config
 
 user = ui.current_user()
 ui.require_role(user, ["donor"])
@@ -40,22 +39,50 @@ with st.expander("Details printed on your donation records"):
             s.get(User, user.id).fssai_number = fssai.strip() or None
         st.success("Saved.")
 
+# Defaults live in session state so the assistant can fill the form below before the widgets are drawn.
+st.session_state.setdefault("pf_qty", 50)
+st.session_state.setdefault("cooked_time", now().time().replace(second=0, microsecond=0))
+
+with st.expander("Describe the food in a sentence (optional)"):
+    if assistant.available():
+        st.caption("A language model suggests values for the form below. You check and correct them before posting. "
+                   "The text you type is sent to the Anthropic API, so leave out anything private.")
+        desc = st.text_area("Description", key="pf_desc", height=80,
+                            placeholder="For example: 40 plates of veg pulao and raita, cooked at 8:15 pm, packed at about 70 degrees")
+        if st.button("Fill the form"):
+            try:
+                values = assistant.parse_listing_text(desc)
+            except assistant.AssistantError as exc:
+                st.warning(str(exc))
+            else:
+                for field, key in {"title": "pf_title", "category": "pf_category", "quantity_meals": "pf_qty",
+                                   "cooked_time": "cooked_time", "temperature_c": "pf_temp", "notes": "pf_notes"}.items():
+                    if field in values:
+                        st.session_state[key] = values[field]
+                if "veg" in values:
+                    st.session_state["pf_diet"] = "Vegetarian" if values["veg"] else "Non-vegetarian"
+                st.session_state["pf_filled"] = True
+                st.rerun()
+    else:
+        st.caption("This is switched off. An administrator can enable it by setting ANTHROPIC_API_KEY.")
+if st.session_state.pop("pf_filled", False):
+    st.info("The form was filled from your description. Please check every field, especially the quantity and the cooked time, before posting.")
+
 st.subheader("New donation")
 st.markdown("**The food**")
-title = st.text_input("What is it?", placeholder="For example: vegetable biryani and raita")
+title = st.text_input("What is it?", key="pf_title", placeholder="For example: vegetable biryani and raita")
 c1, c2, c3 = st.columns(3)
-category = c1.selectbox("Food type", list(safety.SAFE_HOURS))
-quantity = c2.number_input("Approximate meals", min_value=1, value=50, step=5)
-veg = c3.radio("Diet", ["Vegetarian", "Non-vegetarian"], horizontal=True) == "Vegetarian"
-description = st.text_area("Notes for the NGO", height=80, placeholder="Packaging, allergens, containers needed")
+category = c1.selectbox("Food type", list(safety.SAFE_HOURS), key="pf_category")
+quantity = c2.number_input("Approximate meals", min_value=1, step=5, key="pf_qty")
+veg = c3.radio("Diet", ["Vegetarian", "Non-vegetarian"], horizontal=True, key="pf_diet") == "Vegetarian"
+description = st.text_area("Notes for the NGO", height=80, key="pf_notes", placeholder="Packaging, allergens, containers needed")
 
 st.markdown("**Timing and temperature**")
 t1, t2, t3, t4 = st.columns(4)
-st.session_state.setdefault("cooked_time", now().time().replace(second=0, microsecond=0))
 cooked_time = t1.time_input("Cooked or prepared at", key="cooked_time")
 available_hours = t2.slider("Available for pickup (hours)", 0.5, 6.0, 2.0, 0.5)
 temperature = t3.number_input("Food temperature when packed (degrees C)", min_value=-30.0, max_value=120.0,
-                              value=None, step=1.0, placeholder="Optional",
+                              value=None, step=1.0, placeholder="Optional", key="pf_temp",
                               help="Part of the donation record. Measure with a food thermometer if you can.")
 event_type = t4.selectbox("Source", ["Regular service", "Buffet", "Wedding or event", "Conference", "Canteen"])
 st.caption(f"{category}: planning limit of {safety.SAFE_HOURS[category]} hours after cooking. This is a default used by this tool "

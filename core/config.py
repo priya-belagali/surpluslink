@@ -29,6 +29,14 @@ TICK_SECONDS = int(os.getenv("TICK_SECONDS", "10"))
 MAX_MATCH_RADIUS_KM = float(os.getenv("MAX_MATCH_RADIUS_KM", "30"))
 VOLUNTEER_RADIUS_KM = 25.0
 
+# Adaptive matching adds a penalty for NGOs that often waste time (silent or declining), learned from
+# offer history. With no history every NGO gets the same penalty, so the order is just the distance rule.
+ADAPTIVE_MATCHING = _flag("ADAPTIVE_MATCHING", "true")
+
+# Optional language-model assistant that pre-fills the donation form from a sentence.
+# It is off unless ANTHROPIC_API_KEY is set. The text typed is sent to the Anthropic API.
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-5-5")
+
 # DEMO_MODE=true lets every verified NGO see and claim every open listing right away,
 # which switches the priority-offer cascade off. Leave it off when you want to show the cascade.
 DEMO_MODE = _flag("DEMO_MODE")

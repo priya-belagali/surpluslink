@@ -1,13 +1,17 @@
-"""Simple surplus forecasting: average of the same weekday, falling back to the overall average.
+"""Surplus forecasting.
 
-Deliberately basic. With little history it says so instead of guessing; swap in scikit-learn
-once you have months of real data.
+With two weeks or more of history: the average of the same weekday in earlier weeks, counting days with no
+donation as zero, with a range from how much those days varied. With less history: a rougher average of the
+days that had donations. A back-test (see learning.backtest) checks it against simply assuming the overall
+average. Candidate models with more parameters (a regression on weekday and trend) were tried on demo-like
+data and did not beat this, so they are not used.
 """
 from datetime import date
 
 import pandas as pd
 from sqlalchemy import select
 
+from core import learning
 from core.db import Listing
 
 
@@ -20,6 +24,9 @@ def forecast_detail(rows: list[tuple], target: date) -> dict:
     empty = {"expected": None, "low": None, "high": None, "days": 0, "basis": None}
     if not rows:
         return empty
+    better = learning.weekday_forecast(rows, target)
+    if better is not None:
+        return better
     df = pd.DataFrame(rows, columns=["created_at", "meals"])
     df["date"] = pd.to_datetime(df["created_at"]).dt.normalize()
     daily = df.groupby("date")["meals"].sum()
@@ -62,3 +69,9 @@ def platform_forecast(session, target: date) -> tuple[float, int]:
             total += expected
             counted += 1
     return round(total), counted
+
+
+def platform_backtest(session, as_of: date) -> dict | None:
+    """How well the weekday forecast would have done over the last two weeks, against the naive average."""
+    rows = [tuple(r) for r in session.execute(select(Listing.created_at, Listing.quantity_meals)).all()]
+    return learning.backtest(rows, as_of)

@@ -12,7 +12,7 @@ import pytest  # noqa: E402
 
 from core import forecast, geocode, impact, listings, matching, notify, places, records, safety  # noqa: E402
 from core.auth import authenticate, register_user  # noqa: E402
-from core.db import Base, Listing, Offer, engine, init_db, now, session_scope  # noqa: E402
+from core.db import Base, Listing, Offer, User, engine, init_db, now, session_scope  # noqa: E402
 from core.geo import haversine_km  # noqa: E402
 
 BASE = (12.97, 77.59)
@@ -225,4 +225,51 @@ def test_forecast_gives_a_range():
     today = now()
     rows = [(today - timedelta(days=7 * k), 100 + 20 * k) for k in range(1, 4)]
     d = forecast.forecast_detail(rows, today.date())
-    assert d["expected"] == 140 and d["low"] == 120 and d["high"] == 160 and d["basis"] == "same weekday"
+    assert d["expected"] == 140 and d["days"] == 3 and d["basis"].startswith("same weekday")
+    assert round(d["low"], 1) == 114.4 and round(d["high"], 1) == 165.6
+
+
+# ---------------- learning from offers
+
+def test_adaptive_ranking_demotes_an_ngo_that_ignores_offers():
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        twin = register_user(s, email="twin@x.com", password="secret1", name="Twin NGO", role="ngo",
+                             lat=near.lat, lon=near.lon, capacity_meals=100, has_vehicle=True)
+        twin.verified = True
+        s.flush()
+        listing = post(s, donor)
+        for k in range(6):  # "Near NGO" never answered six earlier offers
+            start = now() - timedelta(hours=k + 2)
+            s.add(Offer(listing_id=listing.id, ngo_id=near.id, status="expired", offered_at=start,
+                        expires_at=start + timedelta(minutes=15), resolved_at=start + timedelta(minutes=15)))
+        s.flush()
+        ranking = matching.rank_details(s, listing)
+        assert [r["ngo"].display_name for r in ranking][:2] == ["Twin NGO", "Near NGO"]
+        assert ranking[1]["penalty"] > ranking[0]["penalty"] and ranking[1]["p_accept"] < 0.5
+
+
+def test_offer_outcomes_are_counted_per_ngo():
+    from core import intelligence
+    with session_scope() as s:
+        donor, near, far = make_world(s)
+        listing = post(s, donor)
+        base = now() - timedelta(hours=1)
+        s.add(Offer(listing_id=listing.id, ngo_id=far.id, status="accepted", offered_at=base,
+                    expires_at=base + timedelta(minutes=15), resolved_at=base + timedelta(minutes=3)))
+        s.add(Offer(listing_id=listing.id, ngo_id=far.id, status="declined", offered_at=base,
+                    expires_at=base + timedelta(minutes=15), resolved_at=base + timedelta(minutes=5)))
+        s.flush()
+        h = intelligence.ngo_history(s)[far.id]
+        assert (h.accepted, h.declined, h.expired) == (1, 1, 0) and h.accept_minutes == 3 and h.fail_minutes == 5
+
+
+def test_demo_data_gives_matching_something_to_learn_from():
+    from core import demo, intelligence, learning
+    with session_scope() as s:
+        demo.seed(s)
+        names = {u.id: u.name for u in s.query(User).filter_by(role="ngo")}
+        hist = intelligence.ngo_history(s)
+        chance = {names[i]: learning.acceptance_probability(h.accepted, h.total) for i, h in hist.items()}
+        assert chance["Annapurna Food Bank (demo)"] > chance["Hope Kitchen Trust (demo)"]
+        assert demo.seed_if_empty(s) is False  # a second call changes nothing

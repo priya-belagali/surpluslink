@@ -190,6 +190,25 @@ def timeline_html(events: list[tuple[datetime, str]], pending=None, at: datetime
     return f'<ol class="tl">{"".join(items)}</ol>'
 
 
+def rank_table(rows: list[dict]) -> pd.DataFrame:
+    """The working behind an NGO ranking, one row per NGO (from matching.rank_details)."""
+    return pd.DataFrame([{
+        "NGO": r["ngo"].display_name,
+        "Distance (km)": r["distance"],
+        "Fits the batch": "yes" if r["capacity_ok"] else "no",
+        "Own vehicle": "yes" if r["vehicle"] else "no",
+        "Past offers accepted": f"{r['history'].accepted} of {r['history'].total}",
+        "Estimated chance of accepting": f"{r['p_accept']:.0%}",
+        "Expected wait (min)": round(r["wait_min"], 1),
+        "Score (lower is better)": r["score"],
+    } for r in rows])
+
+
+RANK_NOTE = ("Score = distance in km, plus 15 if the NGO cannot take the whole batch, minus 4 if it has its own vehicle, "
+             "plus a waiting penalty learned from how it handled earlier offers (silent, declined, or accepted, and how fast). "
+             "NGOs with no history get the same neutral penalty. The table is recalculated whenever an offer ends.")
+
+
 # ---------- inputs ----------
 
 def location_input(prefix: str, label: str = "Address", default: tuple[float, float] | None = None):

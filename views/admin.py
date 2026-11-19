@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import select
 
-from core import matching, notify, places, ui
+from core import intelligence, learning, config, matching, notify, places, ui
 from core.db import Listing, User, session_scope
 
 user = ui.current_user()
@@ -44,7 +44,7 @@ for u in approved:
         st.rerun()
 
 st.subheader("Tools")
-t1, t2, t3 = st.tabs(["Housekeeping", "Test an alert", "Coverage data"])
+t1, t2, t3, t4 = st.tabs(["Housekeeping", "Test an alert", "Coverage data", "What matching has learned"])
 with t1:
     st.caption("Expires listings past their pickup window and passes unanswered offers to the next NGO. "
                "This also runs automatically while the app is open.")
@@ -70,6 +70,24 @@ with t3:
                 st.success(f"Saved {count} places.")
             except RuntimeError as exc:
                 st.error(str(exc))
+
+with t4:
+    with session_scope() as s:
+        hist = intelligence.ngo_history(s)
+        names = {u.id: u.display_name for u in s.scalars(select(User).where(User.role == "ngo")).all()}
+    timeout_min = config.OFFER_TIMEOUT_SEC / 60
+    rows = []
+    for ngo_id, name in names.items():
+        h = hist.get(ngo_id, learning.NgoHistory())
+        rows.append({"NGO": name, "Offers": h.total, "Accepted": h.accepted, "Declined": h.declined, "No response": h.expired,
+                     "Estimated chance of accepting": f"{learning.acceptance_probability(h.accepted, h.total):.0%}",
+                     "Expected wait (min)": round(learning.expected_wait_minutes(h, timeout_min), 1)})
+    st.caption("Learned from the outcome of every past offer. With few offers the estimate stays close to 50 percent, so one bad day "
+               "does not sink an NGO. Adaptive matching is " + ("on." if config.ADAPTIVE_MATCHING else "off (set ADAPTIVE_MATCHING=true)."))
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+    else:
+        st.info("No NGOs yet.")
 
 tab_users, tab_listings = st.tabs(["All accounts", "Recent listings"])
 with tab_users:

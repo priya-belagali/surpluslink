@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 
 from core import config
 from core.auth import register_user
-from core.db import Listing, User, now
+from core.db import Listing, Offer, User, now
 
 DEMO_PASSWORD = "demo123"
 
@@ -54,7 +54,11 @@ def seed(session) -> None:
     register_user(session, email="vol1@demo.com", password=DEMO_PASSWORD, name="Ravi (volunteer, demo)",
                   role="volunteer", address=city, lat=lat, lon=lon)
 
-    # Eight weeks of delivered history. Weekends are busier (events and weddings).
+    # Eight weeks of delivered history. Weekends are busier (events and weddings). Each listing also gets the offers
+    # that led to its claim, from NGOs with different habits: the second one often does not answer, so the learned
+    # ranking has something real to learn from. Habits: (chance of silence, chance of accepting if it answers, minutes).
+    habits = [(0.10, 0.85, 3.0), (0.55, 0.70, 8.0), (0.25, 0.80, 5.0)]
+    timeout = 15.0
     n = now()
     serial = 0
     for day in range(56, 0, -1):
@@ -63,13 +67,37 @@ def seed(session) -> None:
             if rng.random() < 0.7:
                 serial += 1
                 meals = rng.randint(30, 80) + (40 if when.weekday() >= 5 else 0)
-                ngo = rng.choice(ngos)
-                session.add(Listing(
+                listing = Listing(
                     donor_id=donor.id, title="Dinner surplus", category="Cooked meal (rice, curry, etc.)",
                     veg=True, quantity_meals=meals, address=donor.address, lat=donor.lat, lon=donor.lon,
                     cooked_at=when - timedelta(hours=1), safe_until=when + timedelta(hours=3),
-                    pickup_by=when + timedelta(hours=2), status="delivered", ngo_id=ngo.id,
-                    created_at=when, claimed_at=when + timedelta(minutes=10),
-                    picked_up_at=when + timedelta(minutes=40), delivered_at=when + timedelta(hours=1, minutes=15),
+                    pickup_by=when + timedelta(hours=2), status="delivered", created_at=when,
                     temperature_c=float(rng.randint(62, 75)), batch_ref=f"SL-{when:%y%m%d}-D{serial}",
-                    qty_distributed=meals, area_distributed=f"Community kitchen, {city}"))
+                    qty_distributed=meals, area_distributed=f"Community kitchen, {city}")
+                session.add(listing)
+                session.flush()
+
+                clock, claimed_by = when, None
+                order = list(range(len(ngos)))
+                rng.shuffle(order)
+                for idx in order:
+                    silent, accept, mean = habits[idx]
+                    if rng.random() < silent:
+                        status, took = "expired", timeout
+                    else:
+                        took = min(timeout, rng.expovariate(1 / mean))
+                        status = "accepted" if rng.random() < accept else "declined"
+                    session.add(Offer(listing_id=listing.id, ngo_id=ngos[idx].id, status=status, offered_at=clock,
+                                      expires_at=clock + timedelta(minutes=timeout),
+                                      resolved_at=clock + timedelta(minutes=took)))
+                    clock += timedelta(minutes=took)
+                    if status == "accepted":
+                        claimed_by = ngos[idx]
+                        break
+                if claimed_by is None:  # nobody took it from the offers: it was opened to all and one NGO claimed it
+                    claimed_by = rng.choice(ngos)
+                    listing.opened_to_all_at = clock
+                listing.ngo_id = claimed_by.id
+                listing.claimed_at = clock
+                listing.picked_up_at = clock + timedelta(minutes=30)
+                listing.delivered_at = clock + timedelta(minutes=65)

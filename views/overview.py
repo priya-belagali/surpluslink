@@ -24,13 +24,18 @@ def live_listings() -> None:
     with session_scope() as s:
         active = s.scalars(select(Listing).where(Listing.donor_id == user.id, Listing.status.in_(ACTIVE))
                            .order_by(Listing.id.desc())).all()
-        blocks = [(l, timeline(s, l), matching.pending_offer(s, l.id) if l.status == "open" else None) for l in active]
+        blocks = [(l, timeline(s, l), matching.pending_offer(s, l.id) if l.status == "open" else None,
+                   matching.rank_details(s, l) if l.status == "open" else None) for l in active]
     if not blocks:
         st.info("You have no active listings.")
-    for l, events, pending in blocks:
+    for l, events, pending, ranking in blocks:
         with st.container(border=True):
             st.markdown(ui.listing_html(l, show_status=True, show_donor=False, at=at), unsafe_allow_html=True)
             st.markdown(ui.timeline_html(events, pending, at), unsafe_allow_html=True)
+            if ranking:
+                with st.expander("Why NGOs are asked in this order"):
+                    st.dataframe(ui.rank_table(ranking), hide_index=True)
+                    st.caption(ui.RANK_NOTE)
 
 
 def donor_view(s):
@@ -49,8 +54,10 @@ def donor_view(s):
         st.caption("There is not enough history for a forecast yet.")
         return
     expected = round(f["expected"])
-    st.markdown(f"Expected surplus on {tomorrow:%A}: about **{expected} meals**. Past range {round(f['low'])} to "
-                f"{round(f['high'])}, from {f['days']} past days ({f['basis']}).")
+    how = (f"The range covers about 80 percent of the same-weekday totals in {f['days']} earlier weeks, counting days with no surplus."
+           if f["basis"].startswith("same weekday") else f"Based on {f['days']} days of history only, so treat it as rough.")
+    st.markdown(f"Expected surplus on {tomorrow:%A}: about **{expected} meals**, likely between {round(f['low'])} and "
+                f"{round(f['high'])}. {how}")
     if st.button("Alert the nearest NGOs in advance"):
         with session_scope() as s2:
             names = matching.heads_up(s2, user, expected, f"on {tomorrow:%A}")

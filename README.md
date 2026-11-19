@@ -18,6 +18,26 @@ delivery produces a record laid out in the format of FSSAI Schedule II.
 - **Coverage.** A map of kitchens and venues from OpenStreetMap next to the NGOs registered on the platform.
 - **Impact.** Meals delivered, estimated food and emissions avoided, and a next-day forecast with a range.
 
+## Where the intelligence is, and what it is not
+
+- **Matching that learns.** From every past offer (accepted, declined, or never answered, and how long it took) the app
+  estimates how likely each NGO is to accept and how long it typically wastes. That becomes a waiting penalty added to the
+  distance rule. Estimates are smoothed so a few offers do not decide anything. Each donor can see the working under
+  "Why NGOs are asked in this order", and Administration shows what has been learned. This is simple statistics (Bayesian
+  smoothing), not a neural network.
+- **A simulation of whether it helps.** On the Impact page, 400 synthetic listings are replayed under two policies,
+  distance only and distance plus learning, against identical hidden NGO behaviour. In five runs with different seeds the
+  learning policy waited less on average each time (by roughly 3 to 19 percent). The behaviour is invented, so this
+  shows the idea works under stated assumptions, not that real NGOs behave this way.
+- **A forecast that tests itself.** Tomorrow's surplus is the same-weekday average with days of no surplus counted as zero,
+  with a range. The Impact page back-tests it over the last two weeks against assuming every day is average. A regression on
+  weekday and trend was tried on demo-like data and did not beat the simple weekday average, so it is not used.
+- **An optional language-model assistant.** If `ANTHROPIC_API_KEY` is set, a donor can describe the food in a sentence and the
+  form is pre-filled. Every value is validated, the donor checks it before posting, and nothing is posted automatically.
+  The text typed is sent to the Anthropic API.
+- **Not AI:** the address search (OpenStreetMap), the distance formula, the safe-time table and the impact estimates are
+  ordinary rules and lookups. The demo history is synthetic.
+
 ## Run it
 
 ```bash
@@ -82,5 +102,3 @@ tests/                   pytest suite
 - Login is demo-grade: no email verification, password reset or attempt limits.
 - The forecast is a same-weekday average. It needs real history to mean anything.
 - The coverage counts come from OpenStreetMap, which is volunteer-edited and incomplete.
-
-
