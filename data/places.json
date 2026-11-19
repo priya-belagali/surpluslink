@@ -1,0 +1,12 @@
+﻿{
+  "fetched_at": "2026-11-19T11:56:00",
+  "city": "Mysuru",
+  "radius_km": 8.0,
+  "source": "OpenStreetMap contributors (ODbL)",
+  "places": [
+    {"name": "Mysuru Palace Area Eatery", "kind": "Restaurant or cafe", "lat": 12.3051, "lon": 76.6551},
+    {"name": "Saraswathipuram Kitchen", "kind": "Canteen", "lat": 12.3085, "lon": 76.6254},
+    {"name": "Gokulam Community Hall", "kind": "Event hall or venue", "lat": 12.3268, "lon": 76.6256},
+    {"name": "Vijayanagar Lodging", "kind": "Hotel or lodging", "lat": 12.3372, "lon": 76.6094}
+  ]
+}
